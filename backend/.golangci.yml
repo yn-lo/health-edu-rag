@@ -1,0 +1,221 @@
+# golangci-lint 配置 — Go 后端代码风格与静态检查门禁（v2）
+# 文档: https://golangci-lint.run/usage/configuration/
+# 约束对应: .harness/specs/conventions.md, .harness/specs/architecture/boundaries.md §5
+# 由 `golangci-lint migrate` 从 v1 自动迁移；v1 语法不再兼容，修改请遵照 v2 语法。
+version: "2"
+run:
+  go: "1.22"
+  modules-download-mode: readonly
+  tests: true
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+linters:
+  default: none
+  enable:
+    - depguard
+    - dupl          # 重复代码块（克隆）检测——补齐重复代码门禁
+    - errcheck
+    - forbidigo
+    - funlen
+    - gocritic
+    - gocyclo
+    - gosec
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - mnd
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck   # 死代码 (U1000) + 综合 SA 系列
+    - unconvert
+    - unparam
+    - unused        # 未引用代码
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: ^log$
+              desc: use log/slog instead
+            - pkg: github.com/sirupsen/logrus
+              desc: use log/slog instead
+            - pkg: github.com/pkg/errors
+              desc: use standard errors + %w
+            - pkg: github.com/golang/protobuf
+              desc: use google.golang.org/protobuf
+        test-only:
+          files:
+            - '**_test.go'
+            - '**/test/**'
+          deny:
+            - pkg: github.com/stretchr/testify
+              desc: use standard testing + errors.As (mock 由手写实现)
+    dupl:
+      # 70 token：100 时"复制后小改"（换标识符/换字面量）的克隆会逃逸——
+      # LLM 辅助开发最常产出这种形态。降低后误报由 review 把关。
+      threshold: 70
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print(ln|f)?\(
+        - pattern: ^log\.Print(ln|f)?\(
+        - pattern: ^panic\(
+        - pattern: ^os\.Exit\(
+    funlen:
+      lines: 80
+      statements: 60
+      ignore-comments: true
+    gocritic:
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+    gocyclo:
+      min-complexity: 15
+    gosec:
+      excludes:
+        - G104
+      config:
+        global:
+          audit: true
+    lll:
+      line-length: 120
+      tab-width: 4
+    mnd:
+      ignored-numbers:
+        - "0"
+        - "1"
+        - "2"
+      ignored-functions:
+        - strconv.ParseInt
+        - strconv.ParseUint
+        - strconv.ParseFloat
+        - strconv.Itoa
+        - strconv.FormatInt
+        - strconv.FormatFloat
+        - fmt.Sprintf
+        - fmt.Errorf
+        - errors.New
+        - slog.Info
+        - slog.Warn
+        - slog.Error
+        - slog.Debug
+        - make
+        - append
+    revive:
+      severity: warning
+      rules:
+        - name: exported
+          disabled: true
+        - name: var-naming
+          arguments:
+            - - ID
+              - URL
+              - HTTP
+              - JSON
+            - - vm
+              - ip
+  exclusions:
+    generated: lax
+    rules:
+      # dupl 排除 _test.go：阈值 70 下测试文件产生 90+ 项结构性噪音
+      # （E2E 子测试/角色门禁循环体骨架重复，属有意为之的显式测试形态，
+      # 与前端 jscpd 忽略 **/tests/** 一致）。逻辑层由阈值 70 覆盖（见下方分层排除）。
+      - linters:
+          - dupl
+          - errcheck
+          - funlen
+          - gocyclo
+          - gosec
+          - lll
+          - unparam
+        path: _test\.go
+      - linters:
+          - dupl
+          - errcheck
+          - funlen
+          - gocyclo
+          - gosec
+          - lll
+          - unparam
+        path: tests/integration
+      # dupl 门禁目标：service/platform/shared 层的逻辑克隆（两份实现会各自漂移的真 bug 源）。
+      # handler（薄 CRUD 适配）/ repository（手写 SQL）/ _dto（平铺字段映射）三层
+      # 的骨架同形是本架构的有意形态，dupl 在这三层只产模式噪音，故排除。
+      - linters:
+          - dupl
+        path: .*handler.*\.go
+      - linters:
+          - dupl
+        path: .*repository.*\.go
+      - linters:
+          - dupl
+        path: .*_dto\.go
+      - linters:
+          - forbidigo
+        path: cmd/
+      - linters:
+          - funlen
+          - gocritic
+          - gocyclo
+          - lll
+          - revive
+        path: wire_gen\.go
+      - linters:
+          - dupl
+          - errcheck
+          - funlen
+          - gocritic
+          - gocyclo
+          - gosec
+          - lll
+          - revive
+          - unparam
+        path: internal/platform/postgres/sqlc/
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+severity:
+  default: warning
+  rules:
+    - linters:
+        - gosec
+      severity: error
+    - linters:
+        - staticcheck
+      severity: error
+    - linters:
+        - errcheck
+      severity: error
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - health-edu-rag
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - wire_gen\.go

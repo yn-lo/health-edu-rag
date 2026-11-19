@@ -1,0 +1,60 @@
+# Health Edu RAG Frontend 知识地图
+
+> 本文件仅描述前端子项目。跨项目通用原则（MCP 工具优先策略、Ponytail、TDD 工作流、全局安全红线）见根目录 [../AGENTS.md](../AGENTS.md)。
+
+## 项目概述
+
+Health Edu RAG Frontend 是一个双 MPA（多页应用）健康平台，包含患者聊天门户（/chat）和员工管理门户（/staff）。技术栈为 Vue 3.5 + TypeScript + Vite 6 + Tailwind CSS 4 + Pinia + vue-router 4 + ofetch。UI 组件全部为自研（tokens.css 设计令牌 + components.css `.ds-*` 组件类 + Tailwind 工具类），不依赖第三方 UI 库。
+
+## 知识导航
+
+| 主题        | 规范文件                                               |
+| --------- | -------------------------------------------------- |
+| 架构总览      | .harness/specs/architecture/overview.md           |
+| 层级边界      | .harness/specs/architecture/boundaries.md          |
+| 数据流       | .harness/specs/architecture/data-flow.md          |
+| 样式规范      | .harness/specs/conventions/styling.md              |
+| 认证页设计语言  | design.md                                          |
+| 约束工具      | .harness/constraints/README.md                     |
+| 门禁规范（单一入口 / 状态语义 / 自测） | [.harness/constraints/README.md](.harness/constraints/README.md#门禁规则索引) |
+| 后端 API 端点（代码即文档） | 后端各域 `handler/router.go` + 契约测试 `backend/tests/api_contract_test.go` |
+| 真实环境 E2E 测试指南 | [.harness/specs/testing/e2e.md](.harness/specs/testing/e2e.md) |
+
+
+## 构建与验证
+
+完整门禁（唯一入口，P0+P1+P2；实现见 `.harness/constraints/ci/gate.sh`）：
+
+```bash
+./gate.sh              # 全跑（等价于 .harness/constraints/ci/gate.sh）
+./gate.sh p0           # 仅 P0：lint / 类型 / 架构 / 单测 / 构建 / 样式 / 死代码
+./gate.sh selftest     # 门禁自身验证（注入违规样例，必须被检出）
+```
+
+CI/发布须加 `GATE_STRICT=1`：缺工具或被跳过的检查视为失败，避免「没有运行」被记成「通过」。
+
+快速预检（秒级子集）：
+
+```bash
+npm run type-check && npm run test:arch
+```
+
+## 硬性规则
+
+1. 页面组件优先使用 src/assets/styles 中定义的全局样式（tokens.css / components.css / main.css），严禁手写组件级样式
+2. chat/\* 和 staff/\* 严格隔离，禁止跨端 import
+3. 视图层禁止直接 fetch/axios，必须通过 shared/api
+4. 角色字面量必须用 shared/constants/roles.ts 常量
+5. 禁止 console.log/debug/info（允许 warn/error）
+6. 跨 MPA 跳转必须标注 ponytail:allow-location
+7. 禁止魔法值
+8. 禁止使用CDN
+
+## 样式问题排查
+
+遇到样式不生效（颜色/字号/边框等），先查 [.harness/specs/conventions/styling.md](.harness/specs/conventions/styling.md) 的「Tailwind 4 陷阱与规范」和「样式问题排查清单」两节。常见原因：
+
+1. `@theme inline` 变量前缀错误（`--text-*` = 字号，`--color-text-*` = 颜色）
+2. 组件样式被 unlayered preflight 覆盖（`components.css` 禁止包裹 `@layer`）
+3. `var()` 无效值回退到继承色（禁止 `text-[var(--xxx-font-size)]`，用 `text-body-sm` 等）
+4. Vite 代码分割导致 preflight 变成 unlayered

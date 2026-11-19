@@ -1,0 +1,156 @@
+package repository
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"health-edu-rag/internal/domain/base/entity"
+	"health-edu-rag/internal/platform/postgres"
+)
+
+// NotificationRepo 站内通知仓储，基于 pgx 手写 SQL。
+type NotificationRepo struct {
+	pool *pgxpool.Pool
+}
+
+// NewNotificationRepo 构造通知仓储。
+func NewNotificationRepo(pool *pgxpool.Pool) *NotificationRepo {
+	return &NotificationRepo{pool: pool}
+}
+
+const notificationColumns = `id, recipient_role, recipient_dept_id, type, title, body, ref_id, is_read, created_at`
+
+// notificationDeptVisibility 科室可见性子句：广播通知（recipient_dept_id IS NULL）对所有科室可见，
+// 定向通知仅对 recipient_dept_id = $2 可见；该参数为 NULL 时仅广播通知可见。
+// 约定：四个查询一律把**科室参数放在 $2**（markReadQuery 因此把角色放到 $3）。早期版本在
+// markReadQuery 里把角色放在 $2、却仍以 $2 表示科室，结果角色字符串被当 BIGINT 使用、第三个参数
+// 无处可放，语句必然执行失败（P2）。
+const notificationDeptVisibility = `(recipient_dept_id IS NULL OR ($2::BIGINT IS NOT NULL AND recipient_dept_id = $2))`
+
+const createNotificationQuery = `
+INSERT INTO notifications (recipient_role, recipient_dept_id, type, title, body, ref_id)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, created_at`
+
+// Create 插入一条通知，通过 RETURNING 回填 ID/CreatedAt。
+func (r *NotificationRepo) Create(ctx context.Context, n *entity.Notification) error {
+	tx, _ := postgres.TxFromCtx(ctx)
+	exec := r.pool.QueryRow
+	if tx != nil {
+		exec = tx.QueryRow
+	}
+	err := exec(ctx, createNotificationQuery,
+		n.RecipientRole, n.RecipientDeptID, n.Type, n.Title, n.Body, n.RefID,
+	).Scan(&n.ID, &n.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("insert notification: %w", err)
+	}
+	n.IsRead = false
+	return nil
+}
+
+var listForRoleQuery = `
+SELECT ` + notificationColumns + `
+FROM notifications
+WHERE recipient_role = $1 AND ` + notificationDeptVisibility + `
+ORDER BY is_read ASC, created_at DESC
+LIMIT $3`
+
+// ListForRole 返回指定角色+科室可见的通知，未读优先、其后按时间倒序。
+func (r *NotificationRepo) ListForRole(
+	ctx context.Context, role string, deptID *int64, limit int,
+) ([]*entity.Notification, error) {
+	rows, err := r.pool.Query(ctx, listForRoleQuery, role, deptID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query notifications: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]*entity.Notification, 0)
+	for rows.Next() {
+		n := &entity.Notification{}
+		if err := rows.Scan(
+			&n.ID, &n.RecipientRole, &n.RecipientDeptID, &n.Type, &n.Title,
+			&n.Body, &n.RefID, &n.IsRead, &n.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan notification: %w", err)
+		}
+		result = append(result, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate notifications: %w", err)
+	}
+	return result, nil
+}
+
+// markReadQuery 单条标记：$1=id、$2=deptID、$3=role（科室固定 $2，角色因 id 占位后移到 $3）。
+var markReadQuery = `
+UPDATE notifications SET is_read = true
+WHERE id = $1 AND ` + notificationDeptVisibility + ` AND recipient_role = $3`
+
+// MarkRead 将单条通知标记为已读（含角色+科室校验，防 IDOR）。
+func (r *NotificationRepo) MarkRead(ctx context.Context, id int64, role string, deptID *int64) error {
+	tx, _ := postgres.TxFromCtx(ctx)
+	exec := r.pool.Exec
+	if tx != nil {
+		exec = tx.Exec
+	}
+	// 参数顺序对齐 markReadQuery 的占位符：$1=id、$2=deptID、$3=role（故科室在 role 之前）。
+	tag, err := exec(ctx, markReadQuery, id, deptID, role)
+	if err != nil {
+		return fmt.Errorf("mark notification read: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("mark notification read: no rows affected (id=%d, role=%s)", id, role)
+	}
+	return nil
+}
+
+var markAllReadQuery = `
+UPDATE notifications SET is_read = true
+WHERE recipient_role = $1 AND ` + notificationDeptVisibility + ` AND NOT is_read`
+
+// MarkAllRead 将指定角色+科室可见的全部未读通知标记为已读。
+func (r *NotificationRepo) MarkAllRead(ctx context.Context, role string, deptID *int64) error {
+	tx, _ := postgres.TxFromCtx(ctx)
+	exec := r.pool.Exec
+	if tx != nil {
+		exec = tx.Exec
+	}
+	if _, err := exec(ctx, markAllReadQuery, role, deptID); err != nil {
+		return fmt.Errorf("mark all notifications read: %w", err)
+	}
+	return nil
+}
+
+var unreadCountQuery = `
+SELECT COUNT(*) FROM notifications
+WHERE recipient_role = $1 AND ` + notificationDeptVisibility + ` AND NOT is_read`
+
+// UnreadCount 返回指定角色+科室可见的未读通知数量。
+func (r *NotificationRepo) UnreadCount(ctx context.Context, role string, deptID *int64) (int, error) {
+	var count int
+	if err := r.pool.QueryRow(ctx, unreadCountQuery, role, deptID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count unread notifications: %w", err)
+	}
+	return count, nil
+}
+
+// ExistsForRef 判断同一业务对象（type + ref_id）是否已对该角色/科室投递过通知。
+// 用于通知任务幂等：危机通知由"快速路径 + outbox relay 补投"两条路径投递，重复执行不应重复落库。
+func (r *NotificationRepo) ExistsForRef(
+	ctx context.Context, role string, deptID *int64, notifType, refID string,
+) (bool, error) {
+	const sql = `SELECT EXISTS (
+		SELECT 1 FROM notifications
+		WHERE recipient_role = $1 AND type = $2 AND ref_id = $3
+		  AND (recipient_dept_id IS NOT DISTINCT FROM $4)
+	)`
+	var exists bool
+	if err := r.pool.QueryRow(ctx, sql, role, notifType, refID, deptID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check notification exists: %w", err)
+	}
+	return exists, nil
+}

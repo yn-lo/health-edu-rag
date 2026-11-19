@@ -1,0 +1,308 @@
+/**
+ * chat Pinia store 单元测试
+ * 覆盖：list/get/update/delete/messages 状态同步逻辑
+ *
+ * 对齐 stores/chat.ts：store 已移除 createConversation action（后端无 POST /conversations，
+ * 新会话由 SSE 隐式创建），无 submitFeedback（后端无 feedback 端点）。
+ */
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { setActivePinia, createPinia } from 'pinia'
+import type { Conversation, Message } from '@/shared/types/chat'
+
+/** 构造测试用 Conversation — 对齐后端 ConversationResponse */
+function makeConv(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: 'conv-1',
+    title: '测试会话',
+    locked_dept_id: null,
+    archived: false,
+    last_message_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  }
+}
+
+/** 构造测试用 Message — 对齐后端 MessageResponse */
+function makeMsg(id: string, content: string): Message {
+  return {
+    id,
+    conversation_id: 'conv-1',
+    role: 'assistant',
+    content,
+    result_code: 'ANSWERED',
+    references: [],
+    created_at: '2026-01-01T00:00:00Z',
+  }
+}
+
+// mock chat API 模块（仅包含 store 实际依赖的函数）
+vi.mock('@/shared/api/chat', () => ({
+  listConversations: vi.fn(),
+  getConversation: vi.fn(),
+  updateConversation: vi.fn(),
+  deleteConversation: vi.fn(),
+  listMessages: vi.fn(),
+}))
+
+import * as chatApi from '@/shared/api/chat'
+import { useChatStore } from '@/stores/chat'
+
+const apiMocks = chatApi as unknown as Record<string, ReturnType<typeof vi.fn>>
+
+describe('useChatStore', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    for (const key of Object.keys(apiMocks)) {
+      apiMocks[key].mockReset()
+    }
+  })
+
+  it('fetchConversations 填充会话列表（解包 items）', async () => {
+    apiMocks.listConversations.mockResolvedValue({
+      items: [makeConv({ id: 'a' }), makeConv({ id: 'b' })],
+      total: 2,
+      page: 1,
+      page_size: 20,
+    })
+    const store = useChatStore()
+
+    await store.fetchConversations()
+
+    expect(store.conversations).toHaveLength(2)
+    expect(store.conversations[0].id).toBe('a')
+    expect(store.loading).toBe(false)
+  })
+
+  it('fetchConversations 失败时 loading 复位', async () => {
+    apiMocks.listConversations.mockRejectedValue(new Error('boom'))
+    const store = useChatStore()
+
+    await expect(store.fetchConversations()).rejects.toThrow('boom')
+    expect(store.loading).toBe(false)
+  })
+
+  it('fetchConversation 命中已存在会话时原地替换', async () => {
+    const fetched = makeConv({ id: 'c1', title: '更新后标题', archived: true })
+    apiMocks.getConversation.mockResolvedValue(fetched)
+    const store = useChatStore()
+    store.conversations.push(makeConv({ id: 'c1', title: '旧标题' }))
+
+    const result = await store.fetchConversation('c1')
+
+    expect(result.archived).toBe(true)
+    expect(store.conversations).toHaveLength(1)
+    expect(store.conversations[0].title).toBe('更新后标题')
+    expect(store.currentConversation?.id).toBe('c1')
+  })
+
+  it('fetchConversation 列表中不存在时前置插入', async () => {
+    const fetched = makeConv({ id: 'c2', title: '新加载的' })
+    apiMocks.getConversation.mockResolvedValue(fetched)
+    const store = useChatStore()
+
+    await store.fetchConversation('c2')
+
+    expect(store.conversations).toHaveLength(1)
+    expect(store.conversations[0].id).toBe('c2')
+  })
+
+  // P1 快速切换会话：A 的迟到详情/消息响应不得覆盖已切换到的 B。
+  it('快速切换 A→B：A 的迟到详情不覆盖 B（代次过期丢弃）', async () => {
+    const store = useChatStore()
+    let resolveA!: (value: Conversation) => void
+    apiMocks.getConversation.mockImplementation((id: string) =>
+      id === 'A' ? new Promise<Conversation>((resolve) => { resolveA = resolve }) : Promise.resolve(makeConv({ id: 'B' })),
+    )
+    apiMocks.listMessages.mockImplementation(async (id: string) => [
+      { ...makeMsg(`msg-${id}`, `answer ${id}`), conversation_id: id },
+    ])
+
+    // 与 ChatConversation.openConversation 相同的 await 顺序（详情 → 消息），且共用同一代次。
+    const open = async (id: string) => {
+      const epoch = store.beginConversationLoad()
+      const conv = await store.fetchConversation(id, epoch)
+      if (!store.isCurrentLoad(epoch)) return
+      await store.fetchMessages(id, epoch)
+    }
+
+    const old = open('A')   // A 的详情挂起
+    await open('B')         // 先切到 B 并完成
+    resolveA!(makeConv({ id: 'A' })) // A 的详情此刻才返回
+    await old
+
+    // 界面必须仍是 B：currentConversation 与 messages 均不得被 A 覆盖。
+    expect(store.currentConversation?.id).toBe('B')
+    expect(store.messages[0]?.conversation_id).toBe('B')
+  })
+
+  // P1 切换会话加载期间：旧会话消息必须立即隔离，历史就位前不得发送。
+  // 回归自审查复现：切换 B 时保留 A 的消息且允许发送，随后 B 的历史被 localWriteSeq 守卫整体丢弃。
+  it('切换会话立即隔离旧消息并进入加载态，历史就位后恢复', async () => {
+    const store = useChatStore()
+    store.messages = [{ ...makeMsg('old-A', 'A 的旧回答'), conversation_id: 'A' }]
+    let finish!: (value: Message[]) => void
+    apiMocks.listMessages.mockImplementation(
+      () => new Promise<Message[]>((resolve) => { finish = resolve }),
+    )
+
+    // 与 ChatConversation.openConversation 相同：切换即 beginConversationLoad
+    const epoch = store.beginConversationLoad()
+    expect(store.messages).toHaveLength(0)      // 旧会话消息不得残留
+    expect(store.messagesLoading).toBe(true)    // 加载态（页面据此禁用发送）
+    store.currentConversation = makeConv({ id: 'B' })
+
+    const load = store.fetchMessages('B', epoch)
+    finish([{ ...makeMsg('history-B', 'B 的历史'), conversation_id: 'B' }])
+    await load
+
+    expect(store.messages.map((m) => m.conversation_id)).toEqual(['B'])
+    expect(store.messagesLoading).toBe(false)
+  })
+
+  it('会话加载失败或代次过期时加载态正确收尾（不会永久禁止发送）', async () => {
+    const store = useChatStore()
+    apiMocks.listMessages.mockRejectedValue(new Error('boom'))
+    const epoch = store.beginConversationLoad()
+    await expect(store.fetchMessages('B', epoch)).rejects.toThrow('boom')
+    expect(store.messagesLoading).toBe(false)   // fetchMessages 失败也要退出加载态
+
+    // 详情阶段失败（未走到 fetchMessages）由 openConversation 的 catch → endConversationLoad 收尾
+    const failedDetail = store.beginConversationLoad()
+    expect(store.messagesLoading).toBe(true)
+    store.endConversationLoad(failedDetail)
+    expect(store.messagesLoading).toBe(false)
+
+    // 过期代次的收尾不得覆盖新会话的加载态
+    const stale = store.beginConversationLoad()
+    store.beginConversationLoad()
+    store.endConversationLoad(stale)
+    expect(store.messagesLoading).toBe(true)
+  })
+
+  it('updateConversation 同步更新列表和 currentConversation', async () => {
+    const updated = makeConv({ id: 'u1', title: '重命名后', archived: true })
+    apiMocks.updateConversation.mockResolvedValue(updated)
+    const store = useChatStore()
+    store.conversations.push(makeConv({ id: 'u1', title: '重命名前' }))
+    store.currentConversation = makeConv({ id: 'u1', title: '重命名前' })
+
+    const result = await store.updateConversation('u1', { title: '重命名后' })
+
+    expect(apiMocks.updateConversation).toHaveBeenCalledWith('u1', { title: '重命名后' })
+    expect(result.title).toBe('重命名后')
+    expect(store.conversations[0].title).toBe('重命名后')
+    expect(store.currentConversation?.title).toBe('重命名后')
+  })
+
+  it('updateConversation 当 currentConversation 不是该 id 时不被改动', async () => {
+    const updated = makeConv({ id: 'u2', title: 'X' })
+    apiMocks.updateConversation.mockResolvedValue(updated)
+    const store = useChatStore()
+    store.currentConversation = makeConv({ id: 'other' })
+
+    await store.updateConversation('u2', { archived: true })
+
+    expect(store.currentConversation?.id).toBe('other')
+  })
+
+  it('deleteConversation 从列表移除并清空 current（命中）', async () => {
+    apiMocks.deleteConversation.mockResolvedValue({ success: true })
+    const store = useChatStore()
+    store.conversations.push(makeConv({ id: 'd1' }), makeConv({ id: 'd2' }))
+    store.currentConversation = makeConv({ id: 'd1' })
+    store.messages.push(makeMsg('m1', 'msg'))
+
+    await store.deleteConversation('d1')
+
+    expect(store.conversations).toHaveLength(1)
+    expect(store.conversations[0].id).toBe('d2')
+    expect(store.currentConversation).toBeNull()
+    expect(store.messages).toHaveLength(0)
+  })
+
+  it('deleteConversation 不命中 current 时只删列表', async () => {
+    apiMocks.deleteConversation.mockResolvedValue({ success: true })
+    const store = useChatStore()
+    store.conversations.push(makeConv({ id: 'd1' }), makeConv({ id: 'd2' }))
+    store.currentConversation = makeConv({ id: 'd2' })
+    store.messages.push(makeMsg('m1', 'msg'))
+
+    await store.deleteConversation('d1')
+
+    expect(store.conversations).toHaveLength(1)
+    expect(store.currentConversation?.id).toBe('d2')
+    expect(store.messages).toHaveLength(1)
+  })
+
+  it('fetchMessages 填充消息列表', async () => {
+    const msgs = [makeMsg('m1', 'a'), makeMsg('m2', 'b')]
+    apiMocks.listMessages.mockResolvedValue(msgs)
+    const store = useChatStore()
+
+    await store.fetchMessages('conv-1')
+
+    expect(store.messages).toHaveLength(2)
+    expect(store.messages[1].content).toBe('b')
+    expect(store.loading).toBe(false)
+  })
+
+  it('fetchMessages 失败时 loading 复位', async () => {
+    apiMocks.listMessages.mockRejectedValue(new Error('boom'))
+    const store = useChatStore()
+
+    await expect(store.fetchMessages('conv-1')).rejects.toThrow('boom')
+    expect(store.loading).toBe(false)
+  })
+
+  it('addMessage 追加到列表末尾', () => {
+    const store = useChatStore()
+    store.messages.push(makeMsg('m1', 'a'))
+
+    store.addMessage(makeMsg('m2', 'b'))
+
+    expect(store.messages).toHaveLength(2)
+    expect(store.messages[1].id).toBe('m2')
+  })
+
+  it('remapMessageId 用服务端权威 ID 替换本地乐观 ID', () => {
+    const store = useChatStore()
+    store.addMessage(makeMsg('local-user-1', '问题'))
+
+    store.remapMessageId('local-user-1', 'server-user-1')
+
+    expect(store.messages[0].id).toBe('server-user-1')
+  })
+
+  it('remapMessageId 目标已存在时移除本地占位（避免重复气泡）', () => {
+    const store = useChatStore()
+    store.messages.push(makeMsg('server-user-1', '问题'))
+    store.addMessage(makeMsg('local-user-1', '问题'))
+
+    store.remapMessageId('local-user-1', 'server-user-1')
+
+    expect(store.messages).toHaveLength(1)
+    expect(store.messages[0].id).toBe('server-user-1')
+  })
+
+  it('$reset 清空所有状态（登出场景）', async () => {
+    apiMocks.listConversations.mockResolvedValue({
+      items: [makeConv({ id: 'a' })],
+      total: 1, page: 1, page_size: 20,
+    })
+    apiMocks.listMessages.mockResolvedValue([makeMsg('m1', 'msg')])
+    const store = useChatStore()
+    await store.fetchConversations()
+    await store.fetchMessages('conv-1')
+    store.currentConversation = makeConv({ id: 'a' })
+
+    store.$reset()
+
+    expect(store.conversations).toHaveLength(0)
+    expect(store.currentConversation).toBeNull()
+    expect(store.messages).toHaveLength(0)
+    expect(store.loading).toBe(false)
+    // fetchEpoch 重置后，新的 fetchMessages 不会误判为 stale
+    await store.fetchMessages('conv-2')
+    expect(store.messages).toHaveLength(1)
+  })
+})

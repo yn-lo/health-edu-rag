@@ -1,0 +1,132 @@
+/* ═══════════════════════════════════════════════════════════════
+   staff-theme.css — 医护端主题层（浅色克制版）
+   已深度中和为与项目一致的「靛蓝 #6366F1 + 中性浅色」配色：
+   - 品牌：直接复用项目 --bg-brand 靛蓝，移除此前的电光蓝 #0052FF
+   - 表面/墨色/边框/阴影：不再覆盖，回落到项目默认中性浅色 token
+   - 移除深空暗底、径向渐变、强光晕，配色克制、少杂色
+   仅保留少量玻璃态/激活态/语义动效增强。字体不覆写，沿用 tokens.css 的系统字体栈。
+
+   仅由 src/staff/main.ts 在 main.css 之后引入，chat 端不加载。
+   机制：
+     1. :root 令牌覆写 —— 与 tokens.css 同选择器，后加载按级联顺序胜出
+     2. 组件增强 —— 非 layer、最后加载，优先于 @layer components
+   豁免：scripts/style-guard.mjs ALLOWED_HEX_FILES 白名单
+   ═══════════════════════════════════════════════════════════════ */
+:root {
+
+  /* ── 主题专属令牌：主强调 = 项目品牌靛蓝，无额外颜色 ── */
+  --ai-accent: #6366F1;
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --glass-blur: blur(16px) saturate(1.6);
+  --glass-surface: rgba(255, 255, 255, 0.80);
+  /* 高亮浮卡底色：克制靛蓝 tint（承接历史 --ai-gradient-soft 用法） */
+  --ai-gradient-soft: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(129, 140, 248, 0.05));
+
+  /* ── 状态色收敛：warning/alert/primary 统一映射为品牌靛蓝；管理端
+     禁用 --status-success，已迁移到 --brand/* --brand-light（见组件改动），
+     仅保留 error(红) 作为危险/危机语义 ── */
+  --status-primary-default: #6366F1;
+  --status-primary-hover: #818CF8;
+  --status-primary-active: #4F46E5;
+  --status-primary-surface-l1: rgba(99, 102, 241, 0.08);
+  --status-primary-surface-l2: rgba(99, 102, 241, 0.16);
+  --status-primary-surface-l3: rgba(99, 102, 241, 0.32);
+  --status-primary-light: rgba(99, 102, 241, 0.10);
+
+  --status-alert-default: #6366F1;
+  --status-alert-hover: #818CF8;
+  --status-alert-active: #4F46E5;
+  --status-alert-surface-l1: rgba(99, 102, 241, 0.08);
+  --status-alert-surface-l2: rgba(99, 102, 241, 0.16);
+  --status-alert-surface-l3: rgba(99, 102, 241, 0.32);
+  --status-alert-light: rgba(99, 102, 241, 0.10);
+
+  --status-warning-default: #6366F1;
+  --status-warning-hover: #818CF8;
+  --status-warning-active: #4F46E5;
+  --status-warning-surface-l1: rgba(99, 102, 241, 0.08);
+  --status-warning-surface-l2: rgba(99, 102, 241, 0.16);
+  --status-warning-surface-l3: rgba(99, 102, 241, 0.32);
+  --status-warning-light: rgba(99, 102, 241, 0.10);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   组件增强（非 layer，#staff-app 前缀压制 scoped / Tailwind 工具类）
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── 应用外壳：项目默认浅色画布（去深空渐变与暗底） ── */
+#staff-app {
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  background: var(--bg-base-secondary);
+}
+
+#staff-app ::selection {
+  background: var(--bg-brand-popup);
+}
+
+/* ── 顶栏磨玻璃：内容滚动到下方时产生冷雾效果 ────────────── */
+#staff-app header {
+  background: var(--glass-surface);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}
+
+/* ── 纯白浮卡：hover 轻微抬升 + 弹簧按压（阴影走项目默认） ── */
+#staff-app .ds-card {
+  background: var(--bg-white);
+}
+
+#staff-app .ds-card--interactive {
+  transition: box-shadow var(--micro-duration) var(--micro-ease),
+              transform var(--micro-duration) var(--micro-ease);
+}
+
+#staff-app .ds-card--interactive:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+#staff-app .ds-card--interactive:active {
+  transform: translateY(0) scale(var(--press-scale));
+  box-shadow: var(--shadow-xs);
+}
+
+#staff-app .ds-action-card {
+  transition: box-shadow var(--micro-duration) var(--micro-ease),
+              transform var(--micro-duration) var(--micro-ease);
+}
+
+#staff-app .ds-action-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+#staff-app .ds-action-card:active {
+  transform: scale(var(--press-scale));
+  box-shadow: var(--shadow-xs);
+}
+
+/* ── 危机角标呼吸光晕（红色语义保持） ─────────────────────── */
+#staff-app .ds-badge {
+  animation: staff-badge-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes staff-badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--status-error-surface-l3); }
+  50% { box-shadow: 0 0 0 6px rgba(232, 70, 58, 0); }
+}
+
+/* ── 主按钮：实心靛蓝（非渐变，去光晕） ─────────────────── */
+#staff-app .ds-btn--primary {
+  background: var(--bg-brand);
+  border-color: transparent;
+}
+
+#staff-app .ds-btn--primary:hover:not(:disabled) {
+  background: var(--bg-brand-hover);
+}
+
+#staff-app .ds-btn--primary:active:not(:disabled) {
+  background: var(--bg-brand-active);
+}

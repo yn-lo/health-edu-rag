@@ -1,0 +1,98 @@
+# Health Edu RAG 全栈 Docker 部署
+# 一键启动: docker compose up -d
+# 说明：所有凭据（DB/Redis 密码、JWT、加密密钥）来自项目根 .env，本文件不再硬编码。
+
+name: health-edu-rag
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: health-edu-rag-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: Asia/Shanghai
+    # 暴露 5432 供本地开发/测试直接连接；生产环境如需仅内网访问可删除 ports 段。
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: health-edu-rag-redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    # 暴露 6379 供本地开发/测试直接连接；生产环境如需仅内网访问可删除 ports 段。
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  server:
+    build: .
+    container_name: health-edu-rag-server
+    command: ["/bin/server"]
+    ports:
+      - "5230:5230"
+    volumes:
+      # 文章正文图片本地存储（upload.dir），容器重建不丢失
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      HEALTH_EDU_RAG_POSTGRES_DSN: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      HEALTH_EDU_RAG_REDIS_ADDR: "redis:6379"
+      HEALTH_EDU_RAG_REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      HEALTH_EDU_RAG_JWT_SECRET: "${JWT_SECRET}"
+      HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      HEALTH_EDU_RAG_ENV: "${HEALTH_EDU_RAG_ENV:-production}"
+      # 问答默认责任科室 id（公共科室）；匿名/未指定科室的会话落到此科室
+      HEALTH_EDU_RAG_CHAT_DEFAULT_DEPT_ID: "${CHAT_DEFAULT_DEPT_ID:-0}"
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: health-edu-rag-worker
+    command: ["/bin/worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      server:
+        condition: service_started
+    environment:
+      HEALTH_EDU_RAG_POSTGRES_DSN: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      HEALTH_EDU_RAG_REDIS_ADDR: "redis:6379"
+      HEALTH_EDU_RAG_REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      HEALTH_EDU_RAG_JWT_SECRET: "${JWT_SECRET}"
+      HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      HEALTH_EDU_RAG_ENV: "${HEALTH_EDU_RAG_ENV:-production}"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

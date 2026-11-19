@@ -1,0 +1,408 @@
+package rag
+
+import (
+	"context"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"health-edu-rag/internal/shared/constants"
+)
+
+// Decision 输入安全审查决策。
+type Decision int
+
+const (
+	// DecisionAllow 放行（规则层未命中）。
+	DecisionAllow Decision = iota
+	// DecisionBlock 拦截（规则层命中：危机 / 注入）。
+	DecisionBlock
+)
+
+// Crisis 命中危机关键词后的上下文，用于创建 CrisisEvent。
+type Crisis struct {
+	Keywords []string
+	Level    string // constants.CrisisLevel*
+}
+
+// SensitiveWords 三类敏感词，对应 sensitive_words 表的 category。
+type SensitiveWords struct {
+	Suicide   []string // 自杀/自残/想死（→ crisis 事件）
+	Emergency []string // 胸痛/呼吸困难/大出血（→ 追加紧急就医提醒）
+	Injection []string // Prompt 注入（→ 拦截）
+}
+
+// SafetyRuleProvider 跨域：config 域实现（阶段 2 注入）。
+// 提供敏感词与各安全话术；阶段 1 由 DefaultInputSafetyFilter 内置默认值兜底。
+// 已废弃：CrisisHotline（合并到 CrisisResponse）/ MedicationDisclaimer（合并到 SafetyWarningMessage）。
+type SafetyRuleProvider interface {
+	SensitiveWords(ctx context.Context) (SensitiveWords, error)
+	RejectionMessage() string
+	NoKnowledgeMessage() string
+	SystemErrorMessage() string
+	EmergencyMessage() string
+	SafetyWarningMessage() string
+	CrisisResponse() string
+	OutputSafetyRules(ctx context.Context) ([]OutputSafetyRule, error)      // 输出审查规则
+	OutputSafetyMessages(ctx context.Context) (OutputSafetyMessages, error) // 输出审查话术
+}
+
+// SystemPromptProvider 跨域：config 域适配器实现。
+// 提供当前生效的系统提示词**人格声明**（prompt_templates 表 type='system' 且 is_active=true）。
+// 护栏规则由 constants.SystemPromptGuardrails 提供，不经过本接口——不可配置的东西不进 DB。
+// ISP 原则：消费者（chat 域）定义接口，config 域不得反向依赖 chat 域。
+type SystemPromptProvider interface {
+	// SystemPrompt 返回当前生效的人格声明与来源信息（供落库复盘）。
+	// 无 active 模板时返回零值选择（Persona 为空 + TemplateID=0），由调用方用默认人格兜底；
+	// 加载失败返回 error，调用方同样降级——但必须把 err 记入日志，不得静默当成「无配置」。
+	SystemPrompt(ctx context.Context) (SystemPromptSelection, error)
+}
+
+// SystemPromptSelection 生效系统提示词的来源标识（可追溯：哪版模板、是否兜底）。
+type SystemPromptSelection struct {
+	Persona    string // 可配置人格声明；空表示无 DB 配置（用 constants.SystemPromptPersona）
+	TemplateID int64  // 0 = 无 DB 模板
+	Version    int    // 0 = 无 DB 模板
+}
+
+// LLMSafetyChecker 已由统一的 Assessor（见 assessment.go）取代：
+// 关键词门控 + fail-open 的二次审查既覆盖不全（未命中片段的表达会绕过 LLM），
+// 又会在故障时把"无法判断"当成"安全"。原接口与实现已删除。
+
+// InputSafetyFilter 输入侧安全审查：规则层（零延迟快筛）。
+// 语义审查与检索改写由 Assessor 每轮统一完成（REQ-CHAT-007 重构），规则层只做高危表达的快速保护。
+// 已废弃：CrisisHotline（合并到 CrisisResponse）/ MedicationDisclaimer（合并到 SafetyWarningMessage）。
+type InputSafetyFilter interface {
+	// CheckRules 规则层审查。返回决策与（命中危机时的）Crisis 上下文。
+	// 命中即拦截（危机 / 注入），零延迟；未命中不代表安全，语义审查由 Assessor 负责。
+	CheckRules(ctx context.Context, message string) (Decision, *Crisis)
+	// EmergencyCheck 检测紧急症状关键词命中（不拦截，仅作为推送紧急提示事件的信号）。
+	// 由 Service 在 token 流之前调用，决定是否推送紧急就医提醒（REQ-CHAT-010）。
+	EmergencyCheck(ctx context.Context, message string) []string
+	// CrisisResponse 危机话术（命中自杀/自残关键词时返回给患者），包含心理援助热线。
+	CrisisResponse() string
+	// RejectionMessage 拒答话术（注入 / LLM 审查拒绝）。
+	RejectionMessage() string
+	// NoKnowledgeMessage 无知识话术（检索 0 结果 / 检索失败）。
+	NoKnowledgeMessage() string
+	// SystemErrorMessage 系统异常话术（LLM 空输出 / 流中断）。
+	SystemErrorMessage() string
+	// EmergencyMessage 紧急就医话术（命中紧急症状关键词时追加）。
+	EmergencyMessage() string
+	// SafetyWarningMessage 安全警告话术（涉及用药时追加，合并了原 medication_disclaimer）。
+	SafetyWarningMessage() string
+}
+
+// 默认安全话术。对应 SafetyMessages 表的内置兜底值（REQ-NFR-017）。
+const (
+	defaultRejection      = "抱歉，我无法回答这个问题，建议您咨询您的主治医生。"
+	defaultEmergency      = "您描述的症状需要紧急就医，请立即前往最近的医院急诊科或拨打 120。"
+	defaultSafetyWarning  = "请注意：以上信息仅供参考，不能替代专业医疗诊断和治疗。用药请严格遵照医嘱，如有疑问请咨询您的主治医生或药师。"
+	defaultCrisisResponse = "如果您感到痛苦或绝望，请立即联系心理援助热线 400-161-9995 或前往最近医院精神科就诊。您不是一个人，专业的帮助一直都在。"
+	defaultNoKnowledge    = "抱歉，知识库中暂无与您问题相关的内容，建议您咨询主治医生或换个问法试试。"
+	defaultSystemError    = "抱歉，系统暂时繁忙未能生成回答，请稍后重试。"
+)
+
+// defaultSensitiveWords 阶段 1 内置敏感词。阶段 2 由 config 域 SafetyRuleProvider 覆盖。
+// ponytail: 硬编码关键词集合——覆盖医疗宣教场景常见表达，命中率高，折中；
+// 升级路径：阶段 2 由 config 域 SafetyRuleProvider 注入 DB 配置。
+var defaultSensitiveWords = SensitiveWords{
+	Suicide: []string{
+		"自杀", "自残", "想死", "寻死", "轻生", "结束生命", "不想活", "割腕",
+		"了结自己", "了结此生", "活不下去", "了结余生",
+		"s1", "离开这个世", "去另一个世界", "解脱",
+		"kill myself", "suicide", "suicidal", "end my life",
+		"want to die", "self-harm", "self harm",
+	},
+	Emergency: []string{
+		"胸痛", "呼吸困难", "大出血", "咯血", "呕血", "昏迷", "休克", "抽搐",
+		"持续高烧", "剧烈头痛", "意识不清",
+	},
+	Injection: []string{
+		"忽略之前指令", "忽略上面的", "忽略以上", "忘记之前的", "忽略前文",
+		"dan模式", "dan 模式", "jailbreak", "越狱",
+		"prompt injection", "system prompt", "你是ai", "你是一个ai",
+		"ignore previous", "ignore above", "ignore prior",
+		"disregard", "forget your", "override",
+		"act as", "roleplay", "pretend to be", "as an ai",
+		"新的指令", "new instructions",
+	},
+}
+
+// emergencyPatternRules 内置急症正则红旗，补子串表覆盖不到的组合表达。
+// 匹配前先经 normalizeForMatch 归一化（去空白/零宽字符），正则一律 RE2 语法
+// （不支持 lookahead/lookbehind），`.*` 用有界量词收敛，避免跨句误拼。
+// 与 provider 配置的 Emergency 子串表相互独立：provider 覆盖子串表时本表始终作为内置兜底生效。
+// 标签仅用于追踪命中原因，下游只判断 len(hits) > 0，因此返回中文标签是安全的。
+var emergencyPatternRules = []struct {
+	label   string
+	pattern *regexp.Regexp
+}{
+	{
+		"疑似卒中",
+		regexp.MustCompile(
+			`口眼歪斜|半身不遂|半边身子?(无力|发麻|麻木)|一侧肢体(无力|麻木)|` +
+				`一边(手脚|胳膊|腿).{0,4}(没力|无力|发麻|麻木)|` +
+				`(突然|突发).{0,6}(言语不清|说话不清|说不清话|说不(出|清)话)`,
+		),
+	},
+	{"疑似急性胸痛", regexp.MustCompile(`胸口(剧痛|疼得(厉害|受不了))|心前区(剧痛|疼痛|压榨)`)},
+	{
+		"疑似过敏性休克",
+		regexp.MustCompile(
+			`过敏性休克|喉头水肿|全身.{0,20}(皮疹|红疹|风团).{0,20}(呼吸困难|喘不上气|憋气)|` +
+				`嘴唇.{0,10}肿.{0,10}(喘不上气|呼吸(困难|急促|费力)|憋气)`,
+		),
+	},
+	{"中毒或药物过量", regexp.MustCompile(`误服|服毒|农药中毒|药物过量|吃了(一整瓶|一把|大量).{0,6}(药|安眠药)`)},
+	{"急腹症", regexp.MustCompile(`腹部.{0,10}(剧痛|刀割样|不能站)|剧烈腹痛`)},
+	{"儿童惊厥", regexp.MustCompile(`(孩子|婴儿|宝宝|儿童).{0,20}(抽搐|惊厥|抽风)`)},
+	{"严重低血糖", regexp.MustCompile(`低血糖.{0,10}(意识|昏迷|叫不醒)|(心慌|手抖).{0,15}冷汗.{0,15}(晕|意识)`)},
+	{"超高热", regexp.MustCompile(`(体温|烧到|发烧).{0,20}(4[0-9](\.[0-9])?|[四][十])(度|℃)`)},
+	{"大出血", regexp.MustCompile(`血流不止|喷血|吐血.{0,10}(大量|不止)`)},
+}
+
+// matchEmergencyPatterns 返回命中的内置正则红旗标签（按规则声明顺序，天然去重）。
+func matchEmergencyPatterns(normalized string) []string {
+	var hits []string
+	for _, rule := range emergencyPatternRules {
+		if rule.pattern.MatchString(normalized) {
+			hits = append(hits, rule.label)
+		}
+	}
+	return hits
+}
+
+// negationWords 中文否定词，用于 Suicide 关键词的二次过滤（REQ-CHAT-011）。
+// ponytail: 不引入分词依赖——前 12 rune 窗口扫描已覆盖常见"我没有自杀想法"等表述，简化；
+// 上限——超长前缀的复杂否定（如"经过长期思考我确定并非要自杀"中"并非"距关键词 >12 rune）会漏判，
+// 升级路径：引入中文分词后改用依存句法分析。
+// 未覆盖"不"单字——"不想死"/"不愿寻死"这类短否定会被误判为 Block；
+// ponytail: 单字"不"会与"不时"/"不过"等非否定副词误匹配导致漏报，救命场景宁可误报不可漏报，折中。
+var negationWords = []string{"没有", "不曾", "不会", "不想", "并非", "并未", "无"}
+
+// hasNegationBeforeKeyword 检查关键词的所有出现位置前 12 rune 窗口内是否均含否定词。
+// 仅当所有出现都有否定前缀时才返回 true（排除该关键词）；任一出现无否定即确认危机。
+// 救命场景宁可误报不可漏报——多次出现时只要有一处无否定就视为真实意图。
+// ponytail: 12 rune 窗口约覆盖 12 个中文字符；
+// 上限——超长前缀的复杂否定（"并非"距关键词 >12 rune）仍会漏判，升级路径：引入中文分词后改用依存句法分析。
+func hasNegationBeforeKeyword(message, keyword string) bool {
+	if keyword == "" {
+		return false
+	}
+	searchFrom := 0
+	found := false
+	for {
+		idx := strings.Index(message[searchFrom:], keyword)
+		if idx < 0 {
+			return found
+		}
+		found = true
+		absIdx := searchFrom + idx
+		if !hasNegationAtPosition(message, absIdx) {
+			return false
+		}
+		searchFrom = absIdx + len(keyword)
+	}
+}
+
+// hasNegationAtPosition 检查 message 中 byteOffset 位置前的 12 rune 窗口内是否含否定词。
+func hasNegationAtPosition(message string, byteOffset int) bool {
+	if byteOffset <= 0 {
+		return false
+	}
+	runes := []rune(message[:byteOffset])
+	window := 12
+	start := len(runes) - window
+	if start < 0 {
+		start = 0
+	}
+	prefix := string(runes[start:])
+	for _, n := range negationWords {
+		if strings.Contains(prefix, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultInputSafetyFilter 默认实现：内置关键词 + 内置话术。
+// 当 provider 非 nil 时优先使用 provider 的关键词（话术始终走内置默认，避免空值）。
+type DefaultInputSafetyFilter struct {
+	provider SafetyRuleProvider
+}
+
+// NewDefaultInputSafetyFilter 构造默认输入安全过滤器。
+// provider 可为 nil：nil 时使用内置默认关键词。
+func NewDefaultInputSafetyFilter(provider SafetyRuleProvider) *DefaultInputSafetyFilter {
+	return &DefaultInputSafetyFilter{provider: provider}
+}
+
+// CheckRules 规则层审查。流程：
+//  1. 危机关键词命中 → Block + Crisis(high)
+//  2. Prompt 注入命中 → Block
+//  3. 紧急症状命中 → Allow（不拦截，由 Service 在最终回答中追加紧急就医提醒）
+//
+// Suicide 关键词走否定词二次过滤（REQ-CHAT-011）："我没有自杀想法"不应被拦截。
+// hasNegationBeforeKeyword 仅扫描关键词前的字符窗口，不会因关键词自身含否定字（如"不想活"以"不想"开头）而误判——
+// prefix 切片不包含关键词本身，不存在"自否定过滤"问题。
+// 自杀场景的漏报代价（不推送心理援助热线，患者可能自杀）远高于误报代价（多余援助推送），
+// 与 EmergencyCheck 同理——救命场景宁可误报不可漏报。
+func (f *DefaultInputSafetyFilter) CheckRules(ctx context.Context, message string) (Decision, *Crisis) {
+	words := f.words(ctx)
+
+	if hit := matchAny(message, words.Suicide); len(hit) > 0 {
+		// 否定词二次过滤：关键词前 12 rune 窗口内含否定词时跳过该关键词。
+		var confirmed []string
+		for _, kw := range hit {
+			if !hasNegationBeforeKeyword(message, kw) {
+				confirmed = append(confirmed, kw)
+			}
+		}
+		if len(confirmed) > 0 {
+			return DecisionBlock, &Crisis{Keywords: confirmed, Level: constants.CrisisLevelHigh}
+		}
+	}
+
+	if hit := matchAny(message, words.Injection); len(hit) > 0 {
+		return DecisionBlock, nil
+	}
+
+	// 紧急症状仅作信号，不拦截：由 Service 在 done 事件追加 emergency_message。
+	// 这里通过返回 DecisionAllow 让流程继续；Service 可独立调用 EmergencyCheck 获取命中词。
+	return DecisionAllow, nil
+}
+
+// EmergencyCheck 检查是否命中紧急症状关键词。返回命中的关键词切片。
+// 由 Service 在 done 事件前调用，决定是否追加 emergency_message。
+// 用 matchAny——否定词"避免/防止/拒绝"对紧急症状语义反转：
+// "避免胸痛发作""防止大出血"暗示患者已有该症状，若被否定过滤则漏报急救，后果比误报严重得多。
+// 救命场景（Emergency/Suicide 短关键词）均宁可误报不可漏报；
+// Suicide 长关键词走 hasNegationBeforeKeyword 二次过滤，Emergency 不走（紧急症状无关键词自否定问题）。
+func (f *DefaultInputSafetyFilter) EmergencyCheck(ctx context.Context, message string) []string {
+	hits := matchAny(message, f.words(ctx).Emergency)
+	seen := make(map[string]struct{}, len(hits))
+	for _, h := range hits {
+		seen[h] = struct{}{}
+	}
+	// 内置正则红旗作为兜底始终生效（provider 只覆盖子串表，不影响本表）。
+	for _, label := range matchEmergencyPatterns(normalizeForMatch(message)) {
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		seen[label] = struct{}{}
+		hits = append(hits, label)
+	}
+	return hits
+}
+
+func (f *DefaultInputSafetyFilter) words(ctx context.Context) SensitiveWords {
+	if f.provider != nil {
+		// provider 失败或某分类为空时降级使用默认（REQ-NFR-017）。
+		// ponytail: 分类级降级——provider 配置了 Suicide 就用它的，没配 Emergency 就用默认，折中，
+		// 避免管理员未配置某分类时该分类安全审查完全失效。
+		if w, err := f.provider.SensitiveWords(ctx); err == nil {
+			if len(w.Suicide) == 0 {
+				w.Suicide = defaultSensitiveWords.Suicide
+			}
+			if len(w.Emergency) == 0 {
+				w.Emergency = defaultSensitiveWords.Emergency
+			}
+			if len(w.Injection) == 0 {
+				w.Injection = defaultSensitiveWords.Injection
+			}
+			return w
+		}
+	}
+	return defaultSensitiveWords
+}
+
+// CrisisResponse 实现 InputSafetyFilter。
+func (f *DefaultInputSafetyFilter) CrisisResponse() string {
+	if f.provider != nil {
+		return f.provider.CrisisResponse()
+	}
+	return defaultCrisisResponse
+}
+
+// RejectionMessage 实现 InputSafetyFilter。
+func (f *DefaultInputSafetyFilter) RejectionMessage() string {
+	if f.provider != nil {
+		return f.provider.RejectionMessage()
+	}
+	return defaultRejection
+}
+
+// NoKnowledgeMessage 实现 InputSafetyFilter。
+func (f *DefaultInputSafetyFilter) NoKnowledgeMessage() string {
+	if f.provider != nil {
+		return f.provider.NoKnowledgeMessage()
+	}
+	return defaultNoKnowledge
+}
+
+// SystemErrorMessage 实现 InputSafetyFilter。
+func (f *DefaultInputSafetyFilter) SystemErrorMessage() string {
+	if f.provider != nil {
+		return f.provider.SystemErrorMessage()
+	}
+	return defaultSystemError
+}
+
+// EmergencyMessage 实现 InputSafetyFilter。
+func (f *DefaultInputSafetyFilter) EmergencyMessage() string {
+	if f.provider != nil {
+		return f.provider.EmergencyMessage()
+	}
+	return defaultEmergency
+}
+
+// SafetyWarningMessage 实现 InputSafetyFilter（合并了原 medication_disclaimer 语义）。
+func (f *DefaultInputSafetyFilter) SafetyWarningMessage() string {
+	if f.provider != nil {
+		return f.provider.SafetyWarningMessage()
+	}
+	return defaultSafetyWarning
+}
+
+// normalizeForMatch 安全关键词匹配前的输入归一化：小写 + 剥离空白（含全角空格）
+// 与零宽字符，防御"自 杀""自\u200b杀"等插入字符绕过（E2E EDGE-SAFE-002/003 修复）。
+// 关键词与消息同路归一化，含空格的英文短语（"kill myself"）在剥离后仍可匹配。
+// ponytail: 仅覆盖空白与零宽字符两类最常见插入绕过；
+// 上限——谐音/拼音/emoji 替代（"我想 s1"）仍依赖 LLM 层与系统提示词兜底；
+// 升级路径：引入拼音转换或轻量分类模型。
+func normalizeForMatch(s string) string {
+	lower := strings.ToLower(s)
+	var b strings.Builder
+	b.Grow(len(lower))
+	for _, r := range lower {
+		if unicode.IsSpace(r) || r == '\u200b' || r == '\u200c' || r == '\u200d' || r == '\ufeff' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// matchAny 在 message 中扫描 keywords，返回命中的关键词（去重）。
+// 大小写不敏感（英文注入词匹配需要）；归一化后匹配，空格/零宽字符插入不绕过。
+func matchAny(message string, keywords []string) []string {
+	if len(keywords) == 0 {
+		return nil
+	}
+	norm := normalizeForMatch(message)
+	seen := map[string]struct{}{}
+	var hit []string
+	for _, kw := range keywords {
+		if kw == "" {
+			continue
+		}
+		if strings.Contains(norm, normalizeForMatch(kw)) {
+			if _, ok := seen[kw]; !ok {
+				hit = append(hit, kw)
+				seen[kw] = struct{}{}
+			}
+		}
+	}
+	return hit
+}

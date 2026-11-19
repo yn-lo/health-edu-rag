@@ -1,0 +1,419 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+
+	"health-edu-rag/internal/domain/wiki/repository"
+	"health-edu-rag/internal/platform/llm"
+	"health-edu-rag/internal/shared/constants"
+	"health-edu-rag/internal/shared/rag"
+)
+
+// ChunkSearcher 切片检索能力（消费者定义，ISP）。由 repository.ChunkRepo 实现。
+// 纯向量检索：仅依赖向量路（pgvector ANN）。
+type ChunkSearcher interface {
+	SearchByVector(
+		ctx context.Context, embedding []float32, topK int, deptIDs []int64,
+		similarityThreshold float64, embeddingModel string,
+	) ([]repository.ChunkSearchHit, error)
+}
+
+// RAGSearchConfig wiki 域消费的 RAG 配置视图（消费者定义，ISP）。
+// 同时承载检索参数（TopK/SimilarityThreshold/Rerank*/MaxChunks）与切片参数（ChunkSize/ChunkOverlap）：
+// 前者由 SearchService 消费，后者由 adapter.VectorizeHandler 消费，共用同一 provider。
+type RAGSearchConfig struct {
+	TopK                int
+	SimilarityThreshold float64
+	RerankEnabled       bool
+	RerankThreshold     float64
+	MaxChunks           int
+	ChunkSize           int
+	ChunkOverlap        int
+}
+
+// RAGConfigProvider RAG 配置提供者（消费者定义，ISP）。由 config 域适配实现。
+type RAGConfigProvider interface {
+	GetRAGConfig(ctx context.Context) (*RAGSearchConfig, error)
+}
+
+// SearchService 知识检索服务（纯向量检索 + 可选 Rerank，REQ-WIKI-013/014）。
+// 实现 shared 层定义的 rag.KnowledgeSearcher 接口（消费者定义，ISP），由 chat 域注入。
+// 相关性过滤只依赖向量相似度阈值（SimilarityThreshold），低于阈值即裁剪——宁可不答也不给低质候选。
+type SearchService struct {
+	chunks  ChunkSearcher
+	embed   llm.Embedder
+	rerank  llm.Reranker
+	cfgProv RAGConfigProvider
+}
+
+// NewSearchService 构造检索服务。所有依赖均可为 nil（降级返回空切片，避免阻塞 chat 域启动）。
+// 完整功能需 chunks/embed/rerank/cfgProv 均注入；任一为 nil 时按 ponytail 降级原则返回空结果。
+func NewSearchService(
+	chunks ChunkSearcher, embed llm.Embedder, rerank llm.Reranker, cfgProv RAGConfigProvider,
+) *SearchService {
+	return &SearchService{chunks: chunks, embed: embed, rerank: rerank, cfgProv: cfgProv}
+}
+
+// 配置兜底默认值（与 config/entity.DefaultRAGConfig 对齐）。
+const (
+	defaultTopK                = 5
+	defaultSimilarityThreshold = 0.5
+	defaultRerankThreshold     = 0.5
+	defaultMaxChunks           = 10
+	defaultChunkSize           = 500
+	defaultChunkOverlap        = 50
+)
+
+// defaultRAGSearchConfig 配置不可用时的兜底默认值。
+// RerankEnabled 默认 true：提升检索质量；rerank 为 nil 时 SearchSimilarChunks 安全降级跳过。
+var defaultRAGSearchConfig = RAGSearchConfig{
+	TopK:                defaultTopK,
+	SimilarityThreshold: defaultSimilarityThreshold,
+	RerankEnabled:       true,
+	RerankThreshold:     defaultRerankThreshold,
+	MaxChunks:           defaultMaxChunks,
+	ChunkSize:           defaultChunkSize,
+	ChunkOverlap:        defaultChunkOverlap,
+}
+
+// topKMax 配置范围上限，与 config/entity.TopKMax 对齐。
+const topKMax = 50
+
+// SearchSimilarChunks 纯向量检索：pgvector ANN → similarity_threshold 过滤 → 可选 Rerank。
+// 步骤：
+//  1. 调用 LLM Embedding 生成查询向量
+//  2. 调用 SearchByVector 获取 topK 候选（仅向量路，无 BM25）
+//  3. similarity_threshold 强制过滤（唯一相关性闸门，低于阈值一律裁剪）
+//  4. 向量相似度降序排序
+//  5. 若 RAGConfig.RerankEnabled=true 且结果数 > 1，对全部候选调用 LLM Rerank 重排（失败降级原顺序），
+//     再由重排结果截取最终 top_k（先重排后截断，多召回的候选才有机会被选中）
+//
+// Embedding 失败、或向量检索本身失败（DB/索引异常）时直接向上返回 error
+// （严禁静默降级，医疗场景宁报 503 也不给虚假否定，也不把故障说成"知识库没有内容"）。
+// 关键依赖未注入、或检索正常但无命中（含全部低于阈值）时返回空切片（chat 域据此拒答，做到"宁可不答"）。
+func (s *SearchService) SearchSimilarChunks(ctx context.Context, q rag.SearchQuery) ([]rag.Chunk, error) {
+	if s.chunks == nil || s.embed == nil || s.cfgProv == nil {
+		// 依赖未注入：降级为空结果，chat 域走拒答路径（REQ-CHAT-003）。
+		return []rag.Chunk{}, nil
+	}
+
+	cfg, topK, candidateK := s.resolveSearchParams(ctx, q)
+
+	// 步骤 1：生成查询向量（同时取得生成它的模型名，同一客户端快照，P2）。
+	// 失败时直接向上返回 error（严禁静默降级）。
+	queryVec, queryModel, err := s.embedQueryVecWithModel(ctx, q.Query)
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+
+	// 步骤 2：仅向量检索。检索本身失败（DB/索引异常）必须向上返回 error——
+	// 检索故障不等于"知识库没有内容"，静默降级为空会让患者看到误导性的"暂无相关内容"，
+	// 真实故障也被日志级别降为 warn 而难以发现。
+	var deptIDs []int64
+	if q.DeptID != nil {
+		deptIDs = []int64{*q.DeptID}
+	}
+	hits, err := s.chunks.SearchByVector(
+		ctx, queryVec, candidateK, deptIDs, cfg.SimilarityThreshold, queryModel)
+	if err != nil {
+		return nil, fmt.Errorf("vector search: %w", err)
+	}
+	if len(hits) == 0 {
+		return []rag.Chunk{}, nil
+	}
+
+	// 步骤 3~5：相似度过滤 → 排序截断 → 可选 Rerank。
+	hits = s.applyFiltersAndRerank(ctx, q.Query, hits, cfg, topK)
+	if len(hits) == 0 {
+		return []rag.Chunk{}, nil
+	}
+	return toRAGChunks(hits), nil
+}
+
+// applyFiltersAndRerank 检索后处理：similarity_threshold 过滤 → 排序截断 → 可选 Rerank/MMR。
+func (s *SearchService) applyFiltersAndRerank(
+	ctx context.Context, query string, hits []repository.ChunkSearchHit, cfg *RAGSearchConfig, topK int,
+) []repository.ChunkSearchHit {
+	// 步骤 3：similarity_threshold 过滤（唯一相关性闸门，恒生效）。
+	threshold := cfg.SimilarityThreshold
+	hits = filterBySimilarity(hits, threshold)
+	if len(hits) == 0 {
+		return hits
+	}
+
+	slog.InfoContext(ctx, "wiki: RAG search detail",
+		"candidates", len(hits),
+		"similarity_threshold", threshold,
+		"top_k", topK,
+		"rerank_enabled", cfg.RerankEnabled && s.rerank != nil,
+	)
+
+	// 按向量相似度降序排序（不在此截断——截断后再重排会使多召回的候选永远无法被选中）。
+	sort.SliceStable(hits, func(i, j int) bool {
+		return hits[i].Score > hits[j].Score
+	})
+
+	// 步骤 3.5：去重。相同 content_hash（或正文一致）视为重复，保留分数最高（已排首位）的一条，
+	// 避免重复切片占用上下文并放大其权重。
+	hits = dedupHits(hits)
+
+	// 步骤 3.6：多样性筛选。同一篇文章的相邻（重叠）切片可能占满 topK，挤掉其他文章的证据；
+	// 限制同文章条数并剔除相邻切片，候选不足 topK 时再按原排序补齐，避免召回骤降。
+	hits, skipped := diversifyHits(hits, topK)
+	if skipped > 0 {
+		slog.InfoContext(ctx, "wiki: diversify skipped redundant chunks",
+			"skipped", skipped, "remaining", len(hits), "top_k", topK)
+	}
+
+	// 步骤 4：可选 Rerank。先对全部候选重排，再由重排结果截取最终 topK。
+	if cfg.RerankEnabled && s.rerank != nil && len(hits) > 1 {
+		hits = s.applyRerank(ctx, query, hits, topK, cfg.RerankThreshold)
+	} else if len(hits) > topK {
+		hits = hits[:topK]
+	}
+
+	// 逐条记录检索详情。
+	for i, c := range hits {
+		slog.InfoContext(ctx, "wiki: RAG chunk detail",
+			"rank", i+1,
+			"chunk_id", c.ID,
+			"vec_score", c.Score,
+			"content_len", len(c.Content),
+		)
+	}
+	return hits
+}
+
+// resolveSearchParams 解析检索参数：配置不可用时用默认值兜底。
+// topK 取查询参数 → 配置 → 全局默认；检索候选数取 topK * 2，给重排留余量，
+// 若配置了 MaxChunks 则以其为候选上限，上限与配置范围一致。
+// 纯向量单闸：SimilarityThreshold 必须生效——配置 <=0（关闭过滤）时回退默认阈值，
+// 避免"过滤被关闭"导致无关切片泄漏（医疗场景宁可不答也不给低质候选）。
+func (s *SearchService) resolveSearchParams(
+	ctx context.Context, q rag.SearchQuery,
+) (cfg *RAGSearchConfig, topK, candidateK int) {
+	cfg, err := s.cfgProv.GetRAGConfig(ctx)
+	if err != nil || cfg == nil {
+		def := defaultRAGSearchConfig
+		cfg = &def
+	}
+	if cfg.SimilarityThreshold <= 0 {
+		cfg.SimilarityThreshold = defaultSimilarityThreshold
+	}
+	topK = q.TopK
+	if topK <= 0 {
+		topK = cfg.TopK
+	}
+	if topK <= 0 {
+		topK = constants.DefaultTopK
+	}
+	candidateK = topK * 2
+	if cfg.MaxChunks > 0 && candidateK > cfg.MaxChunks {
+		candidateK = cfg.MaxChunks
+	}
+	if candidateK > topKMax {
+		candidateK = topKMax
+	}
+	return cfg, topK, candidateK
+}
+
+// embeddingModel 返回当前查询向量所用模型名；实现未暴露时返回空串（检索侧不做模型过滤）。
+func (s *SearchService) embeddingModel() string {
+	if namer, ok := s.embed.(llm.EmbeddingModelNamer); ok {
+		return namer.EmbeddingModel()
+	}
+	return ""
+}
+
+// embedQueryVecWithModel 生成查询向量并返回生成它的模型名，二者来自同一客户端快照（P2）。
+// 关键：模型过滤必须用"生成该查询向量的模型"——若分别调用 Embed() 与 EmbeddingModel()，
+// 热切换会在两次 Load 之间改变客户端，导致用 A 生成的查询向量却按 B 过滤切片（向量空间混用）。
+// 支持 EmbedderWithModel 时一次调用完成；否则退化为分两次读取（旧 mock 兼容，仅测试路径）。
+func (s *SearchService) embedQueryVecWithModel(
+	ctx context.Context, query string,
+) (vec []float32, model string, err error) {
+	if em, ok := s.embed.(llm.EmbedderWithModel); ok {
+		embeds, m, eerr := em.EmbedWithModel(ctx, []string{query})
+		if eerr != nil {
+			return nil, "", fmt.Errorf("embed query: %w", eerr)
+		}
+		if len(embeds) == 0 {
+			return nil, "", fmt.Errorf("embed query: API returned empty embeddings")
+		}
+		return embeds[0], m, nil
+	}
+	vec, err = s.embedQueryVec(ctx, query)
+	if err != nil {
+		return nil, "", err
+	}
+	return vec, s.embeddingModel(), nil
+}
+
+// embedQueryVec 生成查询向量。失败时向上返回 error，由调用方决定是否降级。
+// Embedding 是唯一不可降级的关键依赖：API 返回空结果同样视为失败（严禁静默降级）。
+func (s *SearchService) embedQueryVec(ctx context.Context, query string) ([]float32, error) {
+	embeds, err := s.embed.Embed(ctx, []string{query})
+	if err != nil {
+		return nil, fmt.Errorf("embed query: %w", err)
+	}
+	if len(embeds) == 0 {
+		return nil, fmt.Errorf("embed query: API returned empty embeddings")
+	}
+	return embeds[0], nil
+}
+
+// toRAGChunks 将向量检索命中项转换为 rag.Chunk。
+func toRAGChunks(hits []repository.ChunkSearchHit) []rag.Chunk {
+	out := make([]rag.Chunk, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, rag.Chunk{
+			ChunkID:      fmt.Sprintf("%d", h.ID),
+			ArticleID:    fmt.Sprintf("%d", h.ArticleID),
+			ArticleTitle: h.ArticleTitle,
+			Content:      h.Content,
+			Score:        h.Score,
+			VecScore:     h.Score,
+			ContentRisk:  h.ContentRisk,
+		})
+	}
+	return out
+}
+
+// filterBySimilarity 保留向量相似度 Score >= threshold 的命中。
+// 纯向量路下 Score 即向量相似度，阈值恒生效，低于阈值一律裁剪。
+func filterBySimilarity(hits []repository.ChunkSearchHit, threshold float64) []repository.ChunkSearchHit {
+	out := make([]repository.ChunkSearchHit, 0, len(hits))
+	for _, h := range hits {
+		if h.Score >= threshold {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// dedupHits 去除重复切片：以 content_hash 为键（为空时退化为去空白后的正文），
+// 保留首次出现（调用方已按相似度降序排序，故保留的是分数最高的一条）。
+func dedupHits(hits []repository.ChunkSearchHit) []repository.ChunkSearchHit {
+	seen := make(map[string]struct{}, len(hits))
+	out := make([]repository.ChunkSearchHit, 0, len(hits))
+	for _, h := range hits {
+		key := h.ContentHash
+		if key == "" {
+			key = strings.TrimSpace(h.Content)
+		}
+		if key == "" {
+			out = append(out, h)
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+// maxHitsPerArticle 多样性筛选：同一篇文章在候选中的最大保留条数。
+const maxHitsPerArticle = 2
+
+// diversifyHits 去重后的多样性筛选（纯函数，输入须已按分数降序排序）：
+//   - 同一 article_id 最多保留 maxHitsPerArticle 条；
+//   - 同文章 chunk_index 相邻（差 <=1）的只保留分数更高的一条（排序在前者）；
+//   - 保留数不足 topK 时，按原排序从被跳过的候选中补齐，避免召回骤降。
+//
+// 返回筛选结果与被跳过（补齐前）的条数，供调用方记录日志。
+func diversifyHits(
+	hits []repository.ChunkSearchHit, topK int,
+) (selected []repository.ChunkSearchHit, skippedCount int) {
+	selected = make([]repository.ChunkSearchHit, 0, len(hits))
+	skipped := make([]repository.ChunkSearchHit, 0, len(hits))
+	counts := make(map[int64]int, 4)
+	keptIndexes := make(map[int64][]int, 4)
+	for _, h := range hits {
+		if counts[h.ArticleID] >= maxHitsPerArticle {
+			skipped = append(skipped, h)
+			continue
+		}
+		adjacent := false
+		for _, idx := range keptIndexes[h.ArticleID] {
+			d := idx - h.ChunkIndex
+			if d < 0 {
+				d = -d
+			}
+			if d <= 1 {
+				adjacent = true
+				break
+			}
+		}
+		if adjacent {
+			skipped = append(skipped, h)
+			continue
+		}
+		counts[h.ArticleID]++
+		keptIndexes[h.ArticleID] = append(keptIndexes[h.ArticleID], h.ChunkIndex)
+		selected = append(selected, h)
+	}
+	skippedCount = len(skipped)
+	for _, h := range skipped {
+		if len(selected) >= topK {
+			break
+		}
+		selected = append(selected, h)
+	}
+	return selected, skippedCount
+}
+
+// applyRerank 调用 LLM Rerank 对 hits 重排，并按 threshold 过滤低分结果，最终截断到 topK。
+// Rerank 失败或返回空时降级为原相似度顺序（同样截断到 topK）。
+// threshold<=0 时不过滤。
+func (s *SearchService) applyRerank(
+	ctx context.Context, query string, hits []repository.ChunkSearchHit, topK int, threshold float64,
+) []repository.ChunkSearchHit {
+	docs := make([]string, len(hits))
+	for i, h := range hits {
+		docs[i] = h.Content
+	}
+	results, err := s.rerank.Rerank(ctx, query, docs, topK)
+	if err != nil {
+		slog.WarnContext(ctx, "wiki: rerank failed, fallback to similarity order", "err", err)
+		return truncateHits(hits, topK)
+	}
+	if len(results) == 0 {
+		return truncateHits(hits, topK)
+	}
+	out := make([]repository.ChunkSearchHit, 0, len(results))
+	for _, r := range results {
+		if r.Index < 0 || r.Index >= len(hits) {
+			continue
+		}
+		if threshold > 0 && r.Score < threshold {
+			continue
+		}
+		out = append(out, hits[r.Index])
+	}
+	// 全部候选都低于重排阈值：视为证据不足，返回空结果让上层真正退出生成。
+	// 不得回退保留向量排序第一条——那等于"重排器认为证据不足时仍继续作答"，
+	// 会让缺少依据的结论进入答案（宁可不答也不给无据回答）。
+	if len(out) == 0 && len(hits) > 0 {
+		slog.WarnContext(ctx, "wiki: rerank filtered all candidates below threshold, abort generation",
+			"threshold", threshold, "candidates", len(hits))
+		return nil
+	}
+	return truncateHits(out, topK)
+}
+
+// truncateHits 截断到 topK（topK<=0 时原样返回）。
+func truncateHits(hits []repository.ChunkSearchHit, topK int) []repository.ChunkSearchHit {
+	if topK > 0 && len(hits) > topK {
+		return hits[:topK]
+	}
+	return hits
+}
+
+// 编译期断言：SearchService 实现 shared 层 rag.KnowledgeSearcher 接口。
+var _ rag.KnowledgeSearcher = (*SearchService)(nil)

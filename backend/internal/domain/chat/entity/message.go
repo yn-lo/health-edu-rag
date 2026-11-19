@@ -1,0 +1,48 @@
+package entity
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Message 消息实体，对应 messages 表。
+// Role 取值见 constants.MessageRoleUser/Assistant。
+// ResultCode 取值见 constants.Result*（user 消息留空）。
+// TurnID 标识"本轮生成"：同一轮的 user 与 assistant 消息共享同一 turn_id，
+// 供幂等重放定位本轮结果、按轮聚合与审计（uuid.Nil 表示历史数据未记录轮次）。
+type Message struct {
+	ID             uuid.UUID
+	ConversationID uuid.UUID
+	TurnID         uuid.UUID
+	Role           string
+	Content        string
+	ResultCode     string
+	// RejectReason 结构化拒答/未作答原因（取值见 constants.RejectReason*，正常回答为空串）。
+	// 匿名会话走 Redis 环 JSON 序列化，omitempty 保证正常回答不额外携带空字段。
+	RejectReason     string `json:"reject_reason,omitempty"`
+	ReferencedChunks []Reference
+	Feedback         *string `json:"feedback"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	// Seq 全局单调递增序号（messages_seq）。同一事务写入的同轮 user/assistant
+	// 消息 seq 严格递增，保证"先问题后回答"的稳定定序（created_at 在同事务内相同）。
+	// json:"-"：不进入匿名环序列化与对外 DTO（前端契约不感知）。
+	Seq int64 `json:"-"`
+	// PromptTemplateID / PromptTemplateVersion 生成该答案时生效的系统提示词模板版本
+	// （0/0 = 无 DB 模板，使用代码内置默认人格）。仅用于事后复盘：
+	// 提示词变更后，"这条答案由哪版提示词生成"只能靠这两列回答。
+	// json:"-"：内部溯源字段，不进入匿名环序列化与对外 DTO。
+	PromptTemplateID      int64 `json:"-"`
+	PromptTemplateVersion int   `json:"-"`
+}
+
+// Reference 引用切片，存储在 messages.referenced_chunks JSONB。
+// 对应契约 GET /api/chat/conversations/{id}/messages 响应中的 references 字段。
+type Reference struct {
+	ChunkID      string  `json:"chunk_id"`
+	ArticleID    string  `json:"article_id"`
+	ArticleTitle string  `json:"article_title"`
+	Content      string  `json:"content"`
+	Score        float64 `json:"score"`
+}

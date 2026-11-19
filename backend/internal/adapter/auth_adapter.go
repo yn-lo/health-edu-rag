@@ -1,0 +1,69 @@
+// Package adapter 提供 auth 域适配器。
+package adapter
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	authrepo "health-edu-rag/internal/domain/auth/repository"
+	wikiservice "health-edu-rag/internal/domain/wiki/service"
+	"health-edu-rag/internal/middleware"
+)
+
+// AuthApplicantRoleResolver 实现 wikiservice.ApplicantRoleResolver。
+// 桥接 auth 域 UserRepo.GetByID 到 wiki 域消费者接口，用于 D-MED-08 单超管自审豁免。
+type AuthApplicantRoleResolver struct {
+	repo *authrepo.UserRepo
+}
+
+// NewAuthApplicantRoleResolver 构造适配器。
+func NewAuthApplicantRoleResolver(repo *authrepo.UserRepo) *AuthApplicantRoleResolver {
+	return &AuthApplicantRoleResolver{repo: repo}
+}
+
+// GetRoleByUserID 返回用户角色；用户不存在返回 "" + error。
+func (r *AuthApplicantRoleResolver) GetRoleByUserID(ctx context.Context, userID int64) (string, error) {
+	u, err := r.repo.GetByID(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("get user role: %w", err)
+	}
+	if u == nil {
+		return "", errors.New("user not found")
+	}
+	return u.Role, nil
+}
+
+// 编译期断言：确保适配器实现接口。
+var _ wikiservice.ApplicantRoleResolver = (*AuthApplicantRoleResolver)(nil)
+
+// AuthSessionStore 实现 middleware.SessionStore：桥接 auth 域 UserRepo.GetByID，
+// 供 JWTAuth 校验账户当前状态（未锁定/未删除）与令牌会话版本，并以最新 role/dept 覆盖令牌声明。
+type AuthSessionStore struct {
+	repo *authrepo.UserRepo
+}
+
+// NewAuthSessionStore 构造适配器。
+func NewAuthSessionStore(repo *authrepo.UserRepo) *AuthSessionStore {
+	return &AuthSessionStore{repo: repo}
+}
+
+// CurrentSession 返回用户当前会话状态；用户不存在/已删除返回 (nil, nil)（由 JWTAuth 判为 401）。
+func (s *AuthSessionStore) CurrentSession(ctx context.Context, userID int64) (*middleware.SessionInfo, error) {
+	u, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("get session user: %w", err)
+	}
+	if u == nil {
+		return nil, nil
+	}
+	return &middleware.SessionInfo{
+		Role:         u.Role,
+		DeptID:       u.PrimaryDeptID,
+		TokenVersion: u.TokenVersion,
+		Active:       !u.IsLocked(),
+	}, nil
+}
+
+// 编译期断言：确保适配器实现接口。
+var _ middleware.SessionStore = (*AuthSessionStore)(nil)

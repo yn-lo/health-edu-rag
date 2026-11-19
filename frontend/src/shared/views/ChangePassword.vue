@@ -1,0 +1,148 @@
+<script setup lang="ts">
+/**
+ * ChangePassword 修改密码页 — 已登录用户
+ *
+ * 后端契约：POST /api/auth/change-password { old_password, new_password }
+ * userID 由 JWT 注入，校验旧密码正确性 + 新密码强度
+ *
+ * 双端共享：患者端 (/chat/change-password) 与医护端 (/staff/change-password) 复用
+ * UI/UX（ui-ux-pro-max §Forms）：密码显隐 / 实时强度 / 内联不一致提示 / loading+toast
+ */
+import { ref, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { useDsToast } from '@/shared/composables/useDsToast'
+import { PageShell, AppHeader, PasswordStrength, DsPasswordField, DsSubmitButton, DsErrorAlert } from '@/shared/components'
+import { useAuthStore } from '@/stores/auth'
+import { errmsg } from '@/shared/api/client'
+
+const router = useRouter()
+const authStore = useAuthStore()
+const { showFailToast, showSuccessToast } = useDsToast()
+
+const oldPassword = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+const loading = ref(false)
+const errorMsg = ref('')
+
+const passwordMismatch = computed(
+ () => confirmPassword.value.length > 0 && newPassword.value !== confirmPassword.value,
+)
+
+/** 新旧密码相同提示（防止无效修改） */
+const sameAsOld = computed(
+ () => oldPassword.value.length > 0 && newPassword.value.length > 0 && oldPassword.value === newPassword.value,
+)
+
+function goBack() {
+ router.back()
+}
+
+async function handleChange() {
+ errorMsg.value = ''
+ if (!oldPassword.value) {
+ errorMsg.value = '请输入原密码'
+ showFailToast(errorMsg.value)
+ return
+ }
+ if (!newPassword.value) {
+ errorMsg.value = '请输入新密码'
+ showFailToast(errorMsg.value)
+ return
+ }
+ if (sameAsOld.value) {
+ errorMsg.value = '新密码不能与原密码相同'
+ showFailToast(errorMsg.value)
+ return
+ }
+ if (newPassword.value !== confirmPassword.value) {
+ errorMsg.value = '两次输入的密码不一致'
+ showFailToast(errorMsg.value)
+ return
+ }
+ loading.value = true
+ try {
+  await authStore.changePassword(oldPassword.value, newPassword.value)
+  // 改密会递增服务端 token_version，当前 access/refresh 立即失效（P2）。
+  // 必须立刻清理本地认证状态并跳登录页：否则页面仍显示"已登录"，
+  // 直到下一次请求收到 401 才被动跳转，期间用户处于不可用状态。
+  showSuccessToast('密码修改成功，请使用新密码重新登录')
+  await authStore.clearAuth()
+  window.location.href = '/login' // ponytail:allow-location 跨 MPA 跳转（chat/staff 共用统一登录页）
+ } catch (e) {
+  errorMsg.value = errmsg(e, '修改失败，请稍后重试')
+  showFailToast(errorMsg.value)
+ } finally {
+  loading.value = false
+ }
+}
+</script>
+
+<template>
+ <PageShell
+  :bottom-nav="false"
+  :padded="false"
+  background="var(--auth-bg)"
+  class="auth-page relative overflow-hidden"
+ >
+  <div class="auth-aura auth-aura--top" aria-hidden="true" />
+
+  <!-- sticky 顶栏：返回按钮独立于内容容器，贴屏幕左缘 -->
+  <AppHeader title="修改密码" @back="goBack" />
+
+  <div class="auth-scroll relative mx-auto flex min-h-dvh w-full max-w-[400px] flex-col px-[var(--spacer-24)]">
+   <!-- 标题区（编辑风） -->
+   <div class="flex flex-col gap-[var(--spacer-8)] pt-[var(--spacer-24)]">
+    <h1 class="font-heading text-heading-lg font-semibold text-text">
+     修改密码
+    </h1>
+    <p class="text-body-base text-text-secondary">
+     为保障账户安全，请定期更新密码
+    </p>
+   </div>
+
+   <!-- 表单（无卡片，下划线输入框） -->
+   <div class="auth-form-area mt-[var(--spacer-24)] flex flex-1 flex-col">
+    <form class="auth-form flex flex-col gap-[var(--spacer-16)]" @submit.prevent="handleChange">
+     <!-- 原密码 -->
+     <div class="auth-field">
+      <label class="auth-label">原密码</label>
+      <DsPasswordField v-model="oldPassword" placeholder="请输入原密码" autocomplete="current-password" aria-label="原密码" tone="brand" />
+     </div>
+
+     <!-- 新密码 -->
+     <div class="auth-field">
+      <label class="auth-label">新密码</label>
+      <DsPasswordField v-model="newPassword" placeholder="设置新密码(8-20位)" autocomplete="new-password" aria-label="新密码" tone="brand">
+       <PasswordStrength :password="newPassword" :segments="4" />
+       <p
+        v-if="sameAsOld"
+        class="text-body-sm text-[var(--status-error-default)]"
+       >
+        新密码不能与原密码相同
+       </p>
+      </DsPasswordField>
+     </div>
+
+     <!-- 确认新密码 -->
+     <div class="auth-field">
+      <label class="auth-label">确认新密码</label>
+      <DsPasswordField v-model="confirmPassword" placeholder="请再次输入新密码" autocomplete="new-password" aria-label="确认新密码" :error="passwordMismatch" tone="brand">
+       <p
+        v-if="passwordMismatch"
+        class="text-body-sm text-[var(--status-error-default)]"
+       >
+        两次输入的密码不一致
+       </p>
+      </DsPasswordField>
+     </div>
+
+     <!-- 错误提示 -->
+     <DsErrorAlert v-if="errorMsg" :message="errorMsg" />
+
+     <DsSubmitButton :loading="loading" text="确认修改" class="auth-submit-btn" />
+    </form>
+   </div>
+  </div>
+ </PageShell>
+</template>

@@ -1,0 +1,276 @@
+@import './tokens.css';
+@import 'tailwindcss';
+@import './components.css';
+
+/* 字体：纯系统字体栈（零下载），见 tokens.css --font-family-* */
+
+/* ────────────────────────────────────────────────────────────
+ * Tailwind 4 主题映射：原子类引用设计令牌
+ * 使用 @theme inline 让 Tailwind 生成对应工具类（bg-brand / text-default / shadow-md 等）
+ * ──────────────────────────────────────────────────────────── */
+@theme inline {
+  /* ── 颜色：品牌主色 ── */
+  --color-brand: var(--bg-brand);
+  --color-brand-hover: var(--bg-brand-hover);
+  --color-brand-active: var(--bg-brand-active);
+  --color-brand-pressed: var(--bg-brand-pressed);
+  --color-brand-disabled: var(--bg-brand-disabled);
+  --color-brand-light: var(--bg-brand-light);
+  --color-brand-popup: var(--bg-brand-popup);
+  --color-brand-text: var(--text-brand);
+
+  /* ── 颜色：背景层级 ── */
+  --color-base: var(--bg-base-default);
+  --color-surface: var(--bg-base-secondary);
+  --color-surface-variant: var(--bg-base-tertiary);
+  --color-overlay: var(--bg-overlay-l1);
+  --color-overlay-2: var(--bg-overlay-l2);
+  --color-overlay-3: var(--bg-overlay-l3);
+  --color-overlay-4: var(--bg-overlay-l4);
+  --color-menu: var(--bg-menu);
+  --color-tooltip: var(--bg-tooltip);
+  --color-invert: var(--bg-invert);
+
+  /* ── 颜色：文本 ── */
+  --color-text: var(--text-default);
+  --color-text-hover: var(--text-default-hover);
+  --color-text-active: var(--text-default-active);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-tertiary: var(--text-tertiary);
+  --color-text-disabled: var(--text-disabled);
+  --color-text-brand: var(--text-brand);
+  --color-text-brand-hover: var(--text-brand-hover);
+  --color-onbrand: var(--text-onbrand);
+  --color-onaccent: var(--text-onaccent);
+
+  /* ── 颜色：图标 ── */
+  --color-icon: var(--icon-default);
+  --color-icon-secondary: var(--icon-secondary);
+  --color-icon-tertiary: var(--icon-tertiary);
+  --color-icon-disabled: var(--icon-disabled);
+  --color-icon-brand: var(--icon-brand);
+  --color-icon-onbrand: var(--icon-onbrand);
+
+  /* ── 颜色：边框 ── */
+  --color-border: var(--border-neutral-l1);
+  --color-border-strong: var(--border-neutral-l2);
+  --color-border-stronger: var(--border-neutral-l3);
+  --color-border-brand: var(--border-brand);
+  --color-border-contrast: var(--border-contrast);
+
+  /* ── 颜色：状态 ── */
+  --color-success: var(--status-success-default);
+  --color-success-hover: var(--status-success-hover);
+  --color-success-surface: var(--status-success-surface-l1);
+  --color-warning: var(--status-alert-default);
+  --color-warning-hover: var(--status-alert-hover);
+  --color-warning-surface: var(--status-alert-surface-l1);
+  --color-error: var(--status-error-default);
+  --color-error-hover: var(--status-error-hover);
+  --color-error-surface: var(--status-error-surface-l1);
+  --color-info: var(--status-primary-default);
+  --color-info-hover: var(--status-primary-hover);
+  --color-info-surface: var(--status-primary-surface-l1);
+
+  /* ── 颜色：辅助色（图表/标签） ── */
+  --color-accent-teal: var(--accent-teal);
+  --color-accent-coral: var(--accent-coral);
+  --color-accent-amber: var(--accent-amber);
+  --color-accent-lime: var(--accent-lime);
+  --color-accent-cyan: var(--accent-cyan);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-magenta: var(--accent-magenta);
+  --color-accent-violet: var(--accent-violet);
+  --color-accent-slate: var(--accent-slate);
+
+  /* ── 颜色：品牌色阶（50-950） ── */
+  --color-brand-50: var(--brand-50);
+  --color-brand-100: var(--brand-100);
+  --color-brand-200: var(--brand-200);
+  --color-brand-300: var(--brand-300);
+  --color-brand-400: var(--brand-400);
+  --color-brand-500: var(--brand-500);
+  --color-brand-600: var(--brand-600);
+  --color-brand-700: var(--brand-700);
+  --color-brand-800: var(--brand-800);
+  --color-brand-900: var(--brand-900);
+  --color-brand-950: var(--brand-950);
+
+  /* ── 颜色：中性灰阶 ── */
+  --color-grey-50: var(--brand-grey-50);
+  --color-grey-100: var(--brand-grey-100);
+  --color-grey-200: var(--brand-grey-200);
+  --color-grey-300: var(--brand-grey-300);
+  --color-grey-400: var(--brand-grey-400);
+  --color-grey-500: var(--brand-grey-500);
+  --color-grey-600: var(--brand-grey-600);
+  --color-grey-700: var(--brand-grey-700);
+  --color-grey-800: var(--brand-grey-800);
+  --color-grey-900: var(--brand-grey-900);
+  --color-grey-950: var(--brand-grey-950);
+
+  /* ── 圆角 ── */
+  --radius-card: var(--radius-12);
+  --radius-card-soft: var(--radius-card-soft);
+  --radius-card-large: var(--radius-card-large);
+  --radius-btn: var(--radius-8);
+  --radius-input: var(--radius-8);
+  --radius-full: var(--radius-full);
+  --radius-pill: var(--radius-pill);
+  --radius-xs: var(--radius-xs);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+  --radius-xl: var(--radius-xl);
+
+  /* ── 间距 ── */
+  --spacing-page: var(--spacer-16);
+  --spacing-card: var(--spacer-16);
+  --spacing-gap: var(--spacer-12);
+  --spacing-xs: var(--spacer-4);
+  --spacing-sm: var(--spacer-8);
+  --spacing-md: var(--spacer-12);
+  --spacing-lg: var(--spacer-16);
+  --spacing-xl: var(--spacer-24);
+  --spacing-2xl: var(--spacer-32);
+
+  /* ── 字体 ── */
+  --font-family-sans: var(--font-family-default);
+  --font-family-heading: var(--font-family-heading);
+  --font-family-metric: var(--font-family-metric);
+  --font-heading: var(--font-family-heading);
+  --font-metric: var(--font-family-metric);
+  --font-weight-medium: var(--font-weight-medium);
+  --font-weight-strong: var(--font-weight-strong);
+
+  /* ── 字号 + 行高 ── */
+  --text-body-xs: var(--body-xs-font-size);
+  --text-body-xs--line-height: var(--body-xs-line-height);
+  --text-body-xs-strong: var(--body-xs-strong-font-size);
+  --text-body-xs-strong--line-height: var(--body-xs-strong-line-height);
+  --text-body-sm: var(--body-sm-font-size);
+  --text-body-sm--line-height: var(--body-sm-line-height);
+  --text-body-sm-strong: var(--body-sm-strong-font-size);
+  --text-body-sm-strong--line-height: var(--body-sm-strong-line-height);
+  --text-body-md: var(--body-md-font-size);
+  --text-body-md--line-height: var(--body-md-line-height);
+  --text-body-md-strong: var(--body-md-strong-font-size);
+  --text-body-md-strong--line-height: var(--body-md-strong-line-height);
+  --text-body-base: var(--body-base-font-size);
+  --text-body-base--line-height: var(--body-base-line-height);
+  --text-body-base-strong: var(--body-base-strong-font-size);
+  --text-body-base-strong--line-height: var(--body-base-strong-line-height);
+  --text-body-lg: var(--body-lg-font-size);
+  --text-body-lg--line-height: var(--body-lg-line-height);
+  --text-heading-3xs: var(--heading-3xs-font-size);
+  --text-heading-3xs--line-height: var(--heading-3xs-line-height);
+  --text-heading-2xs: var(--heading-2xs-font-size);
+  --text-heading-2xs--line-height: var(--heading-2xs-line-height);
+  --text-heading-xs: var(--heading-xs-font-size);
+  --text-heading-xs--line-height: var(--heading-xs-line-height);
+  --text-heading-sm: var(--heading-sm-font-size);
+  --text-heading-sm--line-height: var(--heading-sm-line-height);
+  --text-heading-md: var(--heading-md-font-size);
+  --text-heading-md--line-height: var(--heading-md-line-height);
+  --text-heading-lg: var(--heading-lg-font-size);
+  --text-heading-lg--line-height: var(--heading-lg-line-height);
+  --text-heading-xl: var(--heading-xl-font-size);
+  --text-heading-xl--line-height: var(--heading-xl-line-height);
+  --text-heading-2xl: var(--heading-2xl-font-size);
+  --text-heading-2xl--line-height: var(--heading-2xl-line-height);
+  --text-heading-3xl: var(--heading-3xl-font-size);
+  --text-heading-3xl--line-height: var(--heading-3xl-line-height);
+  --text-heading-display: var(--heading-display-font-size);
+  --text-heading-display--line-height: var(--heading-display-line-height);
+  --text-heading-display-sm: var(--heading-display-sm-font-size);
+  --text-heading-display-sm--line-height: var(--heading-display-sm-line-height);
+  --text-reading: var(--reading-font-size);
+  --text-reading--line-height: var(--reading-line-height);
+
+  /* ── 阴影 ── */
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+  --shadow-brand: var(--shadow-brand);
+  --shadow-card-menu: var(--shadow-card-menu);
+
+  /* ── z-index 层级 ── */
+  --z-dropdown: var(--z-dropdown);
+  --z-sticky: var(--z-sticky);
+  --z-fixed: var(--z-fixed);
+  --z-modal-backdrop: var(--z-modal-backdrop);
+  --z-modal: var(--z-modal);
+  --z-popover: var(--z-popover);
+  --z-toast: var(--z-toast);
+  --z-tooltip: var(--z-tooltip);
+  --z-notification: var(--z-notification);
+
+  /* ── 动效 ── */
+  --duration-fast: var(--duration-fast);
+  --duration-normal: var(--duration-normal);
+  --duration-slow: var(--duration-slow);
+  --ease-out: var(--ease-out);
+  --ease-in-out: var(--ease-in-out);
+  --transition-fast: var(--transition-fast);
+  --transition-normal: var(--transition-normal);
+  --transition-slow: var(--transition-slow);
+}
+
+
+
+/* ────────────────────────────────────────────────────────────
+ * 基础样式
+ * ──────────────────────────────────────────────────────────── */
+body {
+  background: var(--bg-base-secondary);
+  color: var(--text-default);
+  font-family: var(--font-family-default);
+  font-size: var(--body-base-font-size);
+  line-height: var(--body-base-line-height);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* 手机端隐藏全局滚动条，避免 sticky header 偏移 */
+html {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+html::-webkit-scrollbar {
+  display: none;
+}
+body {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+body::-webkit-scrollbar {
+  display: none;
+}
+
+/* 无障碍焦点环：键盘导航时显示 */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* 滚动条隐藏工具类 */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* tabular-nums 工具类（metric 字体数字等宽） */
+.tabular-nums { font-variant-numeric: tabular-nums; }
+
+/* hero-orb 品牌渐变球 */
+.hero-orb {
+  background: linear-gradient(135deg, var(--bg-brand) 0%, var(--bg-brand-hover) 100%);
+  box-shadow: var(--shadow-brand);
+}
+
+/* ds-tabbar 图标状态色（DsTabBar 共享） */
+.tab-icon-active { color: var(--bg-brand); }
+.tab-icon-inactive { color: var(--text-tertiary); }
+
+/* .ds-pill 定义已迁移至 components.css（统一令牌源） */

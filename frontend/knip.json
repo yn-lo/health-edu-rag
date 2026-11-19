@@ -1,0 +1,18 @@
+{
+  "entry": [
+    "scripts/**/*.mjs",
+    "tests/**/*.ts",
+    "src/shared/index.ts",
+    "src/shared/composables/index.ts"
+  ],
+  "project": [
+    "src/**/*.ts",
+    "src/**/*.vue",
+    "src/**/*.css",
+    "tests/**/*.ts",
+    "scripts/**/*.mjs"
+  ],
+  "ignoreExportsUsedInFile": true,
+  "ignoreBinaries": [],
+  "ignoreDependencies": []
+}

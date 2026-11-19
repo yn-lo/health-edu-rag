@@ -1,0 +1,142 @@
+import { apiClient, setTokens, clearTokens, getRefreshToken, isUnauthorizedError } from './client';
+import type {
+  LoginRequest,
+  RegisterRequest,
+  TokenResponse,
+  SuccessResponse,
+  ChangePasswordRequest,
+  UpdateProfileRequest,
+  TokenUser,
+  StaffAccount,
+  StaffAccountCreateRequest,
+  ResetPasswordRequest,
+  InviteCode,
+} from '../types/auth';
+import type { Paginated } from '../types/base';
+import type { UserRole } from '../constants/roles';
+
+/** 用户登出 — 后端要求 body 传 refresh token 才能加黑名单 */
+export async function logout() {
+  // 每次尝试都即时读取最新 refresh token：apiClient 在 401 时会轮换令牌，
+  // 若沿用旧 body 里的 token，后端会拒绝已消费的旧令牌，导致新令牌未被撤销（P2）。
+  const attempt = () => {
+    const refresh = getRefreshToken();
+    // ponytail: 即使本地无 refresh token 也发请求清服务端会话；后端会校验 refresh 非空，折中
+    return apiClient<{ success: boolean }>('/auth/logout', {
+      method: 'POST',
+      body: refresh ? { refresh } : {},
+    });
+  };
+  try {
+    return await attempt();
+  } catch (e) {
+    if (!isUnauthorizedError(e)) throw e;
+    // apiClient 已用旧 body 刷新并重试过一次（失败），此处用轮换后的最新 refresh 再试一次
+    return await attempt();
+  } finally {
+    clearTokens();
+  }
+}
+
+/** 统一登录并存储 token（按 role 自动路由，无需选择 portal） */
+export async function loginAndStore(data: LoginRequest) {
+  const tokens = await apiClient<TokenResponse>('/auth/login', { method: 'POST', body: data });
+  setTokens(tokens.access, tokens.refresh);
+  return tokens;
+}
+
+/** 注册并存储 token（便捷方法） */
+export async function registerAndStore(data: RegisterRequest) {
+  const tokens = await apiClient<TokenResponse>('/auth/register', { method: 'POST', body: data });
+  setTokens(tokens.access, tokens.refresh);
+  return tokens;
+}
+
+/** 已登录用户修改密码 — userID 由 JWT 注入，仅传新旧密码 */
+export function changePassword(oldPassword: string, newPassword: string) {
+  return apiClient<SuccessResponse>('/auth/change-password', {
+    method: 'POST',
+    body: { old_password: oldPassword, new_password: newPassword } satisfies ChangePasswordRequest,
+  });
+}
+
+/** 读取已登录用户个人资料 */
+export function getProfile() {
+  return apiClient<TokenUser>('/auth/profile', { method: 'GET' });
+}
+
+/** 更新已登录用户个人资料 */
+export function updateProfile(data: UpdateProfileRequest) {
+  return apiClient<TokenUser>('/auth/profile', {
+    method: 'PATCH',
+    body: data satisfies UpdateProfileRequest,
+  });
+}
+
+// ===== 管理员账户管理（GET/POST /api/staff/auth/accounts，POST .../lock|unlock） =====
+
+/** 分页查询全部账户（超管可传 include_deleted=true 以包含已删除用户） */
+export function listStaffAccounts(params?: { page?: number; page_size?: number; include_deleted?: boolean }) {
+  return apiClient<Paginated<StaffAccount>>('/staff/auth/accounts', { params });
+}
+
+/** 创建账户（角色权限收口在后端 service 层） */
+export function createStaffAccount(data: StaffAccountCreateRequest) {
+  return apiClient<StaffAccount>('/staff/auth/accounts', { method: 'POST', body: data });
+}
+
+/** 锁定账户（后端禁止锁定自己，返回 409 AUTH_SELF_LOCK） */
+export function lockStaffAccount(id: number) {
+  return apiClient<SuccessResponse>(`/staff/auth/accounts/${id}/lock`, { method: 'POST' });
+}
+
+/** 解锁账户 */
+export function unlockStaffAccount(id: number) {
+  return apiClient<SuccessResponse>(`/staff/auth/accounts/${id}/unlock`, { method: 'POST' });
+}
+
+/** 重置用户密码（管理员操作，无需旧密码） */
+export function resetStaffAccountPassword(id: number, newPassword: string) {
+  return apiClient<SuccessResponse>(`/staff/auth/accounts/${id}/reset-password`, {
+    method: 'POST',
+    body: { new_password: newPassword } satisfies ResetPasswordRequest,
+  });
+}
+
+/** 软删除账户（后端禁止删除自己） */
+export function deleteStaffAccount(id: number) {
+  return apiClient<SuccessResponse>(`/staff/auth/accounts/${id}`, { method: 'DELETE' });
+}
+
+/** 修改账户主科室（超管可改任意；科室管理员仅本科室账户且只能改成本科室） */
+export function updateStaffAccountDept(id: number, deptId: number) {
+  return apiClient<StaffAccount>(`/staff/auth/accounts/${id}/department`, {
+    method: 'PATCH',
+    body: { dept_id: deptId },
+  });
+}
+
+/** 修改账户角色（仅超管；后端禁止修改自己的角色） */
+export function updateStaffAccountRole(id: number, role: UserRole) {
+  return apiClient<StaffAccount>(`/staff/auth/accounts/${id}/role`, {
+    method: 'PATCH',
+    body: { role },
+  });
+}
+
+/** 恢复软删除账户（仅超管） */
+export function restoreStaffAccount(id: number) {
+  return apiClient<StaffAccount>(`/staff/auth/accounts/${id}/restore`, { method: 'POST' });
+}
+
+// ===== 邀请码管理（PATIENT 注册强制邀请码，JWT + RequireAdmin） =====
+
+/** 管理员生成邀请码 — count 可省略（缺省 1，上限 100），每个码 6 位纯数字、有效期 30 天、一次性 */
+export function createInviteCodes(count = 1) {
+  return apiClient<InviteCode[]>('/staff/auth/invite-codes', { method: 'POST', body: { count } });
+}
+
+/** 管理员分页查询邀请码（含已用/已过期） */
+export function listInviteCodes(params?: { page?: number; page_size?: number }) {
+  return apiClient<Paginated<InviteCode>>('/staff/auth/invite-codes', { params });
+}

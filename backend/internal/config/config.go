@@ -1,0 +1,303 @@
+// Package config 加载应用配置（env + yaml），结构化 Config struct。
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/spf13/viper"
+)
+
+// 已知开发占位密钥（config.yaml dev 默认值）。生产环境必须用环境变量覆盖。
+const (
+	DevJWTSecret     = "dev-jwt-secret-change-in-production"     // #nosec G101 -- 开发占位密钥，生产用 env 覆盖
+	DevEncryptionKey = "dev-encryption-key-change-in-production" // #nosec G101 -- 开发占位密钥，生产用 env 覆盖
+)
+
+// EnvDevelopment / EnvProduction 运行环境取值（config.env / HEALTH_EDU_RAG_ENV）。
+// 仅 development 会加载测试数据（seed.dev.sql）；其他取值数据库保持干净。
+const (
+	EnvDevelopment = "development"
+	EnvProduction  = "production"
+)
+
+// WarnIfDevSecrets 安全密钥仍为开发占位值或为空时输出 ERROR 级启动告警。
+// 不阻断启动：本地开发依赖 config.yaml 的 dev 值。
+// ponytail: 告警而非 panic——强拒绝会破坏本地开发流（air/make run 直接用 config.yaml）；
+// 上限——依赖部署者看到告警后注入环境变量。升级路径：引入显式运行模式（如 RUN_MODE=production）后改为 panic。
+func WarnIfDevSecrets(cfg *Config) {
+	if cfg.JWT.Secret == "" || cfg.JWT.Secret == DevJWTSecret {
+		slog.Error("SECURITY: jwt.secret 为空或仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_JWT_SECRET 覆盖（否则可被离线伪造任意身份令牌）")
+	}
+	if cfg.Security.EncryptionKey == DevEncryptionKey {
+		slog.Error("SECURITY: security.encryption_key 仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY 覆盖")
+	}
+}
+
+// 配置默认值（供 setDefaults 注册到 viper）。
+const (
+	defaultServerPort        = 5230
+	defaultReadTimeout       = 15 * time.Second
+	defaultShutdownTimeout   = 10 * time.Second
+	defaultPostgresMaxConns  = 25
+	defaultPostgresMinConns  = 5
+	defaultJWTAccessTTL      = 30 * time.Minute
+	defaultJWTRefreshTTL     = 7 * 24 * time.Hour
+	defaultLLMTimeout        = 60 * time.Second
+	defaultArgon2Memory      = 64 * 1024
+	defaultArgon2Iterations  = 3
+	defaultArgon2Parallelism = 2
+	defaultArgon2SaltLength  = 16
+	defaultArgon2KeyLength   = 32
+
+	// 限流默认值（次/分钟），运行时可通过 Redis rl_cfg:{scope} 热更新覆盖
+	defaultAuthLoginRateLimit        = 10
+	defaultAuthRegisterRateLimit     = 10
+	defaultAuthRefreshRateLimit      = 10
+	defaultChatStreamRateLimit       = 20
+	defaultChatStreamAnonRateLimit   = 5
+	defaultChatStreamAnonGlobalLimit = 300
+
+	// 文章图片上传默认值
+	defaultUploadDir       = "uploads"
+	defaultUploadMaxSizeMB = 5
+)
+
+// Config 应用配置根结构。
+type Config struct {
+	// Env 运行环境：development 时加载测试数据（seed.dev.sql），其余取值数据库保持干净。
+	// 环境变量：HEALTH_EDU_RAG_ENV。默认 development（本地开发友好）。
+	Env       string          `mapstructure:"env"`
+	Server    ServerConfig    `mapstructure:"server"`
+	Postgres  PostgresConfig  `mapstructure:"postgres"`
+	Redis     RedisConfig     `mapstructure:"redis"`
+	JWT       JWTConfig       `mapstructure:"jwt"`
+	LLM       LLMConfig       `mapstructure:"llm"`
+	CORS      CORSConfig      `mapstructure:"cors"`
+	Argon2    Argon2Config    `mapstructure:"argon2"`
+	Security  SecurityConfig  `mapstructure:"security"`
+	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
+	Upload    UploadConfig    `mapstructure:"upload"`
+	Seed      SeedConfig      `mapstructure:"seed"`
+	Chat      ChatConfig      `mapstructure:"chat"`
+}
+
+// ChatConfig 问答（chat 域）行为配置。
+type ChatConfig struct {
+	// DefaultDeptID 问答默认责任科室 id。
+	// 匿名用户与未指定科室（含历史无锁定科室）的会话落到此科室，保证"统一理解与审查"
+	// 始终有科室语境，避免对"术后注意什么"这类常规宣教问题机械追问。
+	// 0 = 未配置：退化为取第一个 is_public 且启用的科室（生产即"公共科室"）。
+	// 环境变量：HEALTH_EDU_RAG_CHAT_DEFAULT_DEPT_ID。
+	DefaultDeptID int64 `mapstructure:"default_dept_id"`
+}
+
+// SeedConfig 初始超管账号配置。
+// AdminPassword 为空时跳过创建/更新 admin，退化为"数据库无内置账号"（生产推荐留空，
+// 由运维通过环境变量注入一次性初始密码）。明文仅存在于进程内存，落库前用 argon2id 现算哈希。
+type SeedConfig struct {
+	AdminPassword string `mapstructure:"admin_password"`
+}
+
+// IsDevelopment 是否为开发环境（决定是否加载 seed.dev.sql 测试数据）。
+func (c *Config) IsDevelopment() bool {
+	return c.Env == "" || c.Env == EnvDevelopment
+}
+
+// ServerConfig HTTP 服务器配置。
+// WriteTimeout 未暴露为配置——SSE 流式响应需禁用 server 级写超时（R7-4），
+// main.go 中硬编码 WriteTimeout=0；非流式端点由各 handler 的 ctx deadline 兜底（如 auth 10s）。
+//
+// TrustedProxies 信任的反向代理 CIDR 列表（D-MED-02 修复）。
+// 仅当 RemoteAddr 命中此列表时才解析 X-Forwarded-For；空列表表示不信任任何代理，
+// 直接用 RemoteAddr 作为客户端 IP（XFF 头被忽略，杜绝伪造绕过 IP 限流）。
+type ServerConfig struct {
+	Port            int           `mapstructure:"port"`
+	ReadTimeout     time.Duration `mapstructure:"read_timeout"`
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+	TrustedProxies  []string      `mapstructure:"trusted_proxies"`
+}
+
+// PostgresConfig PostgreSQL 连接配置。
+type PostgresConfig struct {
+	DSN             string        `mapstructure:"dsn"`
+	MaxConns        int32         `mapstructure:"max_conns"`
+	MinConns        int32         `mapstructure:"min_conns"`
+	MaxConnLifetime time.Duration `mapstructure:"max_conn_lifetime"`
+}
+
+// RedisConfig Redis 连接配置。
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
+}
+
+// JWTConfig JWT 配置（HS256 对称签名）。
+type JWTConfig struct {
+	Secret     string        `mapstructure:"secret"`
+	AccessTTL  time.Duration `mapstructure:"access_ttl"`
+	RefreshTTL time.Duration `mapstructure:"refresh_ttl"`
+	Issuer     string        `mapstructure:"issuer"`
+}
+
+// LLMConfig LLM 客户端配置。
+// 主字段（BaseURL/APIKey/ChatModel/EmbeddingModel/Timeout）作为 chat 默认 provider；
+// Embedding/Rerank 子配置可选，零值字段回退到主配置（向后兼容）。
+//
+// 注：原 RewriteModel/Rewrite（独立查询改写模型）已删除——检索改写并入统一理解与审查（Assessor），
+// 与风险判定同一次调用完成，不再需要独立的改写模型与 provider。
+type LLMConfig struct {
+	BaseURL        string        `mapstructure:"base_url"`
+	APIKey         string        `mapstructure:"api_key"`
+	ChatModel      string        `mapstructure:"chat_model"`
+	EmbeddingModel string        `mapstructure:"embedding_model"`
+	Timeout        time.Duration `mapstructure:"timeout"`
+	// 可选：分离的 provider 配置。零值字段回退到主配置。
+	Embedding ProviderConfig `mapstructure:"embedding"`
+	Rerank    ProviderConfig `mapstructure:"rerank"`
+}
+
+// ProviderConfig 单个 LLM provider 配置（embedding/rerank）。
+// 零值字段表示继承主 LLMConfig 对应字段（BaseURL/APIKey/Timeout 通用，
+// Model 按能力回退：Embedding→EmbeddingModel，Rerank 无主字段回退）。
+type ProviderConfig struct {
+	BaseURL string        `mapstructure:"base_url"`
+	APIKey  string        `mapstructure:"api_key"`
+	Model   string        `mapstructure:"model"`
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// CORSConfig 跨域配置。
+// AllowCredentials 控制是否发送 Access-Control-Allow-Credentials: true。
+// 安全约束：AllowedOrigins 含 "*" 时禁止 AllowCredentials=true（CORS 规范禁止，
+// 且会让任意站点携带 cookie 跨站请求）；CORS 中间件构造阶段会 panic 拦截。
+type CORSConfig struct {
+	AllowedOrigins   []string `mapstructure:"allowed_origins"`
+	AllowCredentials bool     `mapstructure:"allow_credentials"`
+}
+
+// Argon2Config 密码哈希参数（OWASP 2023 推荐）。
+type Argon2Config struct {
+	Memory      uint32 `mapstructure:"memory"`      // 64MB
+	Iterations  uint32 `mapstructure:"iterations"`  // 3
+	Parallelism uint8  `mapstructure:"parallelism"` // 2
+	SaltLength  uint32 `mapstructure:"salt_length"` // 16
+	KeyLength   uint32 `mapstructure:"key_length"`  // 32
+}
+
+// DefaultArgon2 返回 OWASP 2023 推荐的 argon2id 默认参数（与 setDefaults 注册值一致）。
+func DefaultArgon2() Argon2Config {
+	return Argon2Config{
+		Memory:      defaultArgon2Memory,
+		Iterations:  defaultArgon2Iterations,
+		Parallelism: defaultArgon2Parallelism,
+		SaltLength:  defaultArgon2SaltLength,
+		KeyLength:   defaultArgon2KeyLength,
+	}
+}
+
+// SecurityConfig 安全配置。
+// EncryptionKey 用于 AES-GCM 字段级加密（API Key 等），必须显式配置，无默认值。
+// 环境变量：HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY
+type SecurityConfig struct {
+	EncryptionKey string `mapstructure:"encryption_key"`
+}
+
+// RateLimitConfig 限流默认值（启动时从 config.yaml 读取，运行时可通过 Redis 热更新覆盖）。
+// 零值字段使用 setDefaults 的硬编码默认值。
+type RateLimitConfig struct {
+	AuthLogin            int `mapstructure:"auth_login"`
+	AuthRegister         int `mapstructure:"auth_register"`
+	AuthRefresh          int `mapstructure:"auth_refresh"`
+	ChatStream           int `mapstructure:"chat_stream"`
+	ChatStreamAnon       int `mapstructure:"chat_stream_anon"`
+	ChatStreamAnonGlobal int `mapstructure:"chat_stream_anon_global"`
+}
+
+// UploadConfig 知识库文章图片上传配置。
+// Dir 为本地存储目录（相对进程工作目录，docker 部署需挂载卷持久化）；
+// MaxSizeMB 为单张图片大小上限，超限直接拒绝。
+type UploadConfig struct {
+	Dir       string `mapstructure:"dir"`
+	MaxSizeMB int    `mapstructure:"max_size_mb"`
+}
+
+// Load 加载配置：先读 yaml，再用环境变量覆盖。
+func Load() (*Config, error) {
+	v := viper.New()
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath(".")
+	v.AddConfigPath("./config")
+	v.AddConfigPath("/etc/health-edu-rag")
+
+	// 环境变量覆盖（HEALTH_EDU_RAG_SERVER_PORT 等）。
+	// SetEnvKeyReplacer 将嵌套 key 的 "." 替换为 "_"，使 security.encryption_key
+	// 能被 HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY 覆盖；缺少此行会导致所有嵌套配置
+	// 的环境变量覆盖静默失效。
+	v.SetEnvPrefix("health_edu_rag")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	setDefaults(v)
+
+	if err := v.ReadInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		// 配置文件缺失时仅用环境变量+默认值
+	}
+
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func setDefaults(v *viper.Viper) {
+	v.SetDefault("server.port", defaultServerPort)
+	v.SetDefault("server.read_timeout", defaultReadTimeout)
+	v.SetDefault("server.shutdown_timeout", defaultShutdownTimeout)
+
+	v.SetDefault("postgres.max_conns", defaultPostgresMaxConns)
+	v.SetDefault("postgres.min_conns", defaultPostgresMinConns)
+	v.SetDefault("postgres.max_conn_lifetime", time.Hour)
+
+	v.SetDefault("redis.db", 0)
+
+	// jwt.secret 不设代码默认值：必须由 config.yaml 或 HEALTH_EDU_RAG_JWT_SECRET 显式提供，
+	// 避免漏配时静默回落到可预测密钥（配合 WarnIfDevSecrets 启动告警）。
+	v.SetDefault("jwt.access_ttl", defaultJWTAccessTTL)
+	v.SetDefault("jwt.refresh_ttl", defaultJWTRefreshTTL)
+	v.SetDefault("jwt.issuer", "health-edu-rag")
+
+	v.SetDefault("llm.timeout", defaultLLMTimeout)
+
+	// OWASP 2023 推荐的 argon2id 参数
+	v.SetDefault("argon2.memory", defaultArgon2Memory)
+	v.SetDefault("argon2.iterations", defaultArgon2Iterations)
+	v.SetDefault("argon2.parallelism", defaultArgon2Parallelism)
+	v.SetDefault("argon2.salt_length", defaultArgon2SaltLength)
+	v.SetDefault("argon2.key_length", defaultArgon2KeyLength)
+
+	// 限流默认值
+	v.SetDefault("rate_limit.auth_login", defaultAuthLoginRateLimit)
+	v.SetDefault("rate_limit.auth_register", defaultAuthRegisterRateLimit)
+	v.SetDefault("rate_limit.auth_refresh", defaultAuthRefreshRateLimit)
+	v.SetDefault("rate_limit.chat_stream", defaultChatStreamRateLimit)
+	v.SetDefault("rate_limit.chat_stream_anon", defaultChatStreamAnonRateLimit)
+	v.SetDefault("rate_limit.chat_stream_anon_global", defaultChatStreamAnonGlobalLimit)
+
+	// 文章图片上传
+	v.SetDefault("upload.dir", defaultUploadDir)
+	v.SetDefault("upload.max_size_mb", defaultUploadMaxSizeMB)
+
+	// 问答默认责任科室（0 = 未配置，运行时取第一个公共启用科室）
+	v.SetDefault("chat.default_dept_id", 0)
+}

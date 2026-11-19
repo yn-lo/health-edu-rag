@@ -1,0 +1,178 @@
+// Package main 是 HTTP Server 入口。
+// 加载配置、初始化应用、启动 HTTP 服务器，处理 SIGTERM 优雅关闭。
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"health-edu-rag/internal/config"
+	"health-edu-rag/internal/di"
+	"health-edu-rag/internal/middleware"
+	"health-edu-rag/internal/shared/response"
+)
+
+const readHeaderTimeout = 5 * time.Second
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("load config failed", "err", err)
+		panic(err)
+	}
+	config.WarnIfDevSecrets(cfg)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 启动时自动应用数据库 schema + 种子（幂等：内容哈希未变则跳过）。
+	// env=development 时额外加载 seed.dev.sql 测试数据；生产环境数据库保持干净。
+	if err := di.ApplySchema(ctx, cfg.Postgres.DSN, cfg.Env, cfg.Seed.AdminPassword); err != nil {
+		slog.Error("run schema apply failed", "err", err)
+		panic(err)
+	}
+
+	app, err := di.NewApp(ctx, cfg)
+	if err != nil {
+		slog.Error("init app failed", "err", err)
+		panic(err)
+	}
+	defer app.Infra.Close()
+
+	r := buildRouter(app)
+
+	srv := &http.Server{
+		Addr:              ":" + strconv.Itoa(cfg.Server.Port),
+		Handler:           r,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		ReadHeaderTimeout: readHeaderTimeout, // slowloris 防护（显式短超时）
+		// WriteTimeout=0 禁用 server 级写超时——SSE 流式响应可能持续数分钟，
+		// server 级 WriteTimeout 会在 deadline 到期时截断每个 chunk flush（R7-4 修复）。
+		// 超时控制由各 handler 的 ctx deadline 负责（chat 流式有 chatPendingLockTTL 5min + 应用层 deadline）。
+		WriteTimeout: 0,
+	}
+
+	go func() {
+		slog.Info("http server starting", "port", cfg.Server.Port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "err", err)
+			panic(err)
+		}
+	}()
+
+	<-ctx.Done()
+	slog.Info("shutdown signal received, gracefully stopping...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("graceful shutdown failed", "err", err)
+	}
+	slog.Info("server stopped")
+}
+
+// buildRouter 构建路由树，装配所有域的路由。
+func buildRouter(app *di.App) http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.Recover)
+	r.Use(middleware.RequestLog)
+	r.Use(middleware.CORS(app.Infra.Cfg.CORS))
+	// 静态资源缓存策略：/assets/*（文件名含内容哈希）长期 immutable，SPA 入口 HTML no-cache。
+	// 必须排在 Compress 之前，保证 Cache-Control 在 WriteHeader 前写入。
+	r.Use(middleware.StaticCache)
+	// gzip 压缩：患者端首屏 JS+CSS 从 395KB 降到 ~137KB（见 middleware.Compress 白名单）。
+	r.Use(middleware.Compress)
+
+	// 健康检查
+	r.Get("/healthz", healthz(app.Infra))
+
+	// auth 域（14 端点：7 公开/刷新/密码重置 + 3 已登录自助 + 4 管理员账户管理）
+	app.Auth.Mount(r, app.Infra.Auth, app.Infra.RateLimiter, app.Infra.Cfg.RateLimit)
+
+	// base 域（1 端点）
+	app.Base.Mount(r)
+
+	// base 域：站内通知（4 端点，/api/staff/notifications）
+	app.Notifications.Mount(r)
+
+	// wiki 域（14 端点：2 公开 + 7 文章管理 + 5 引用授权）
+	app.Wiki.Mount(r)
+
+	// chat 域（8 端点：SSE + 会话管理 + 危机事件）
+	app.Chat.Mount(r)
+
+	// config 域：公开只读端点（品牌配置），须在鉴权路由组之外注册。
+	app.Config.RegisterPublicRoutes(r)
+
+	// config 域（22 端点，需要 JWT + RequireAdmin）
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.JWTAuth(app.Infra.Auth), middleware.RequireAdmin())
+		app.Config.RegisterRoutes(r)
+	})
+
+	// 前端静态文件托管 + SPA fallback（同源部署）
+	// /api/* 的 404 返回 JSON；其他路径先尝试静态文件，不存在则返回对应 SPA 入口 HTML，
+	// 由客户端 vue-router 接管路由（/staff/* → staff.html，其他 → chat.html）。
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			response.WriteJSON(w, http.StatusNotFound, map[string]any{
+				"code":    "NOT_FOUND",
+				"message": "请求的资源不存在",
+			})
+			return
+		}
+		middleware.ServeSPA(w, r)
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		response.WriteJSON(w, http.StatusMethodNotAllowed, map[string]any{
+			"code":    "METHOD_NOT_ALLOWED",
+			"message": "请求方法不允许",
+		})
+	})
+
+	return r
+}
+
+// healthzTimeout 健康检查依赖探测超时（DB+Redis Ping）。
+const healthzTimeout = 3 * time.Second
+
+// healthz 健康检查端点（契约 §7.1）。检查 DB + Redis，返回 {status, database, redis, timestamp}。
+// 任一依赖不可用返回 503；全部 ok 返回 200。
+func healthz(infra *di.Infrastructure) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), healthzTimeout)
+		defer cancel()
+
+		dbStat := "ok"
+		if err := infra.Pool.Ping(ctx); err != nil {
+			dbStat = "fail"
+		}
+		redisStat := "ok"
+		if err := infra.Redis.Ping(ctx).Err(); err != nil {
+			redisStat = "fail"
+		}
+
+		status := "ok"
+		httpCode := http.StatusOK
+		if dbStat == "fail" || redisStat == "fail" {
+			status = "degraded"
+			httpCode = http.StatusServiceUnavailable
+		}
+		response.WriteJSON(w, httpCode, map[string]any{
+			"status":    status,
+			"database":  dbStat,
+			"redis":     redisStat,
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+}
