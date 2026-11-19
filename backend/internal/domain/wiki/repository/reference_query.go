@@ -2,6 +2,7 @@ package repository
 
 import (
 	"fmt"
+	"strings"
 
 	"health-edu-rag/internal/shared/constants"
 )
@@ -37,6 +38,12 @@ func buildListWhere(f ListFilter) (where string, args []any) {
 		args = append(args, f.DeptIDs)
 		where += fmt.Sprintf(
 			" AND (ref.source_dept_id = ANY($%d) OR ref.target_dept_id = ANY($%d))", len(args), len(args))
+	}
+	if s := strings.TrimSpace(f.Search); s != "" {
+		args = append(args, "%"+s+"%")
+		where += fmt.Sprintf(
+			" AND (a.title ILIKE $%d OR sd.name ILIKE $%d OR td.name ILIKE $%d)",
+			len(args), len(args), len(args))
 	}
 	return where, args
 }

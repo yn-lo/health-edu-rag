@@ -254,23 +254,81 @@ const hasChildrenQuery = `SELECT EXISTS(SELECT 1 FROM departments WHERE parent_i
 // HasChildren 检查指定科室是否有子科室（REQ-BASE-010 删除前置校验）。
 func (r *DepartmentRepo) HasChildren(ctx context.Context, id int64) (bool, error) {
 	var exists bool
-	if err := r.pool.QueryRow(ctx, hasChildrenQuery, id).Scan(&exists); err != nil {
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, hasChildrenQuery, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check children: %w", err)
 	}
 	return exists, nil
 }
 
-const hasUsersQuery = `SELECT EXISTS(SELECT 1 FROM user_departments WHERE department_id = $1)`
+const usersExistQuery = `SELECT EXISTS(SELECT 1 FROM user_departments WHERE department_id = $1)`
 
 // HasUsers 检查指定科室是否有关联用户（REQ-BASE-010 删除前置校验）。
 // 注意：schema 中 user_departments.department_id ON DELETE CASCADE，
 // 但 service 层选择显式拦截，避免误删导致用户失去主科室关联。
 func (r *DepartmentRepo) HasUsers(ctx context.Context, id int64) (bool, error) {
 	var exists bool
-	if err := r.pool.QueryRow(ctx, hasUsersQuery, id).Scan(&exists); err != nil {
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, usersExistQuery, id).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check users: %w", err)
 	}
 	return exists, nil
+}
+
+const articlesExistQuery = `SELECT EXISTS(
+	SELECT 1 FROM articles WHERE department_id = $1 AND is_deleted = false
+)`
+
+// HasArticles 检查指定科室是否仍有未删除文章。
+// 删除科室前必须先把文章软删除或迁移；软删除历史行会在删除科室时被外键置 NULL（不再对患者可见）。
+func (r *DepartmentRepo) HasArticles(ctx context.Context, id int64) (bool, error) {
+	var exists bool
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, articlesExistQuery, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check articles: %w", err)
+	}
+	return exists, nil
+}
+
+const lockDepartmentQuery = `SELECT 1 FROM departments WHERE id = $1 FOR UPDATE`
+
+// LockByID 在当前事务内锁定科室行，序列化并发删除/新增文章/子科室/用户关联。
+// 返回 false 表示科室已不存在。
+func (r *DepartmentRepo) LockByID(ctx context.Context, id int64) (bool, error) {
+	var one int
+	err := postgres.Q(ctx, r.pool).QueryRow(ctx, lockDepartmentQuery, id).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock department: %w", err)
+	}
+	return true, nil
+}
+
+const referencesExistQuery = `SELECT EXISTS(
+	SELECT 1 FROM article_references
+	WHERE (source_dept_id = $1 OR target_dept_id = $1)
+	  AND status IN ('pending', 'approved')
+)`
+
+// HasReferences 检查科室是否仍有生效中的跨科室引用（pending/approved）。
+// rejected/revoked 是已关闭的历史记录：不阻止删除，由 DeleteClosedReferences 在删除事务内清理。
+func (r *DepartmentRepo) HasReferences(ctx context.Context, id int64) (bool, error) {
+	var exists bool
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, referencesExistQuery, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check references: %w", err)
+	}
+	return exists, nil
+}
+
+const deleteClosedReferencesQuery = `DELETE FROM article_references
+	WHERE (source_dept_id = $1 OR target_dept_id = $1)
+	  AND status IN ('rejected', 'revoked')`
+
+// DeleteClosedReferences 清理科室已关闭的引用历史，满足 article_references 的 RESTRICT 外键。
+func (r *DepartmentRepo) DeleteClosedReferences(ctx context.Context, id int64) error {
+	if _, err := postgres.Q(ctx, r.pool).Exec(ctx, deleteClosedReferencesQuery, id); err != nil {
+		return fmt.Errorf("delete closed references: %w", err)
+	}
+	return nil
 }
 
 const siblingNameExistsQuery = `

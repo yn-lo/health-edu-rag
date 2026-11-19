@@ -89,6 +89,13 @@ function canSee(level: ActionLevel): boolean {
 /** 科室管理 — 文章/引用(全体医护) + 人员(管理员) */
 const deptActions = computed<QuickAction[]>(() => [
  { icon: FileText, label: '文章管理', routeName: 'staff-articles', level: 'staff' },
+ {
+  icon: FileText,
+  label: '文章审核',
+  routeName: 'staff-article-review',
+  badge: pendingArticles.value > 0 ? pendingArticles.value : undefined,
+  level: 'admin',
+ },
  { icon: Share2, label: '引用管理', routeName: 'staff-references', level: 'staff' },
  { icon: Users, label: '人员管理', routeName: 'staff-config-accounts', level: 'admin' },
 ])
@@ -114,7 +121,7 @@ const systemActions = computed<QuickAction[]>(() => [
   icon: Sparkles,
   label: '提示词模板',
   routeName: 'staff-config-prompts',
-  level: 'admin',
+  level: 'super',
  },
  {
   icon: SlidersHorizontal,
@@ -223,6 +230,7 @@ onMounted(async () => {
       :key="action.label"
       :icon="action.icon"
       :label="action.label"
+      :badge="action.badge"
       @click="goRoute(action.routeName)"
      />
     </QuickActionGrid>

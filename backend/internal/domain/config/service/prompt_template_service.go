@@ -56,7 +56,9 @@ func (s *ConfigService) CreatePromptTemplate(
 		IsActive:    isActive,
 		Description: req.Description,
 	}
-	if err := s.promptTemplateRepo.Create(ctx, t); err != nil {
+	if err := s.withTx(ctx, func(ctx context.Context) error {
+		return s.promptTemplateRepo.Create(ctx, t)
+	}); err != nil {
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperrors.Conflict("CONFIG_PROMPT_VERSION_CONFLICT", "版本号冲突，请重新提交")
 		}
@@ -82,7 +84,12 @@ func (s *ConfigService) UpdatePromptTemplate(
 			return nil, err
 		}
 	}
-	t, err := s.promptTemplateRepo.UpdateContentAndActive(ctx, id, req.Content, req.IsActive)
+	var t *entity.PromptTemplate
+	err := s.withTx(ctx, func(ctx context.Context) error {
+		var uerr error
+		t, uerr = s.promptTemplateRepo.UpdateContentAndActive(ctx, id, req.Content, req.IsActive)
+		return uerr
+	})
 	if err != nil {
 		return nil, translateRepoErr(err, "CONFIG_PROMPT_NOT_FOUND", "Prompt 模板不存在")
 	}

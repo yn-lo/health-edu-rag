@@ -29,7 +29,10 @@ func main() {
 		slog.Error("load config failed", "err", err)
 		panic(err)
 	}
-	config.WarnIfDevSecrets(cfg)
+	if err := config.ValidateSecrets(cfg); err != nil {
+		slog.Error("security config invalid", "err", err)
+		panic(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

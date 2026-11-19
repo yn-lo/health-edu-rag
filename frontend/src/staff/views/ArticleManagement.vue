@@ -19,7 +19,7 @@ import { wikiApi, fmtShortDate, fmtCompact } from '@/shared'
 import { errmsg } from '@/shared/api/client'
 import type { ArticleStaff, ArticleStatus } from '@/shared'
 import { useAuthStore } from '@/stores/auth'
-import { ADMIN_ROLES, SUPER_ADMIN_ROLE } from '@/shared/constants/roles'
+import { ADMIN_ROLES, DEPT_ADMIN_ROLE, SUPER_ADMIN_ROLE } from '@/shared/constants/roles'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -39,6 +39,20 @@ const activeTab = ref('all')
 
 const canManageFeatured = computed(() => Boolean(authStore.user && ADMIN_ROLES.includes(authStore.user.role)))
 const isSuperAdmin = computed(() => authStore.user?.role === SUPER_ADMIN_ROLE)
+
+/** 与后端 assertCanAuthorOrAdmin 对齐：超管 / 本科室管理员 / 作者本人可编辑、归档、删除。 */
+function canManage(article: ArticleStaff): boolean {
+  const user = authStore.user
+  if (!user) return false
+  if (user.role === SUPER_ADMIN_ROLE) return true
+  if (article.author_id === user.id) return true
+  return user.role === DEPT_ADMIN_ROLE && article.department_id === user.dept_id
+}
+
+/** 行点击：无权限的文章不进入编辑页（后端也会 403，避免把用户带到错误页）。 */
+function openArticle(article: ArticleStaff) {
+  if (canManage(article)) goEdit(article.id)
+}
 
 /** 科室筛选仅超管可见；非超管由服务端按本科室隔离 */
 const { options: deptOptions, load: loadDeptOptions } = useDepartmentOptions({ id: null, label: '全部科室' })
@@ -96,38 +110,49 @@ function metaText(article: ArticleStaff): string {
 /** 是否存在未加载的下一页 */
 const hasMore = computed(() => articles.value.length < total.value)
 
-async function fetchPage(target: number, replace: boolean) {
+/** 请求序号：筛选/搜索/并发 loadMore 时丢弃过期响应，避免旧数据覆盖新结果 */
+let requestSeq = 0
+
+async function fetchPage(target: number, replace: boolean, seq: number) {
   const res = await wikiApi.listMyArticles({
     page: target,
     page_size: PAGE_SIZE,
     department_id: scopedDeptId.value,
+    status: activeTab.value === 'all' ? undefined : (activeTab.value as ArticleStatus),
+    search: searchQuery.value.trim() || undefined,
   })
+  if (seq !== requestSeq) return false
   total.value = res.total
   currentPage.value = target
   articles.value = replace ? res.items : [...articles.value, ...res.items]
+  return true
 }
 
 /** 首屏/筛选变化时重新加载 */
 async function reload() {
+  const seq = ++requestSeq
   loading.value = true
+  loadingMore.value = false
   try {
-    await fetchPage(1, true)
+    await fetchPage(1, true, seq)
   } catch (e) {
-    showFailToast(errmsg(e, '加载失败'))
+    if (seq === requestSeq) showFailToast(errmsg(e, '加载失败'))
   } finally {
-    loading.value = false
+    if (seq === requestSeq) loading.value = false
   }
 }
 
 async function loadMore() {
   if (loading.value || loadingMore.value || !hasMore.value) return
+  const seq = requestSeq
   loadingMore.value = true
   try {
-    await fetchPage(currentPage.value + 1, false)
+    await fetchPage(currentPage.value + 1, false, seq)
   } catch (e) {
-    showFailToast(errmsg(e, '加载更多失败'))
+    if (seq === requestSeq) showFailToast(errmsg(e, '加载更多失败'))
   } finally {
-    loadingMore.value = false
+    // reload 会重置序号并复位 loadingMore；这里只在本轮仍有效时复位，避免旧请求干扰新轮次。
+    if (seq === requestSeq) loadingMore.value = false
   }
 }
 
@@ -168,20 +193,10 @@ const featuredGroup = computed(() => {
     )
 })
 
-/** 普通列表：置顶组展示时排除置顶文章，避免同一篇出现两次 */
+/** 普通列表：状态/搜索已由服务端过滤；置顶组展示时排除置顶文章，避免同一篇出现两次 */
 const plainArticles = computed(() => {
-  let list = activeTab.value === 'all'
-    ? articles.value
-    : articles.value.filter((a) => a.status === activeTab.value)
-  if (showFeaturedGroup.value) list = list.filter((a) => a.featured_rank === 0)
-  const q = searchQuery.value.trim().toLowerCase()
-  if (!q) return list
-  return list.filter(
-    (a) =>
-      a.title.toLowerCase().includes(q) ||
-      a.author_name.toLowerCase().includes(q) ||
-      a.department_name.toLowerCase().includes(q),
-  )
+  if (!showFeaturedGroup.value) return articles.value
+  return articles.value.filter((a) => a.featured_rank === 0)
 })
 
 /** 本科室下一个置顶位（末位 + 1，置顶不限数量） */
@@ -329,6 +344,19 @@ watch(deptFilter, () => {
   void reload()
 })
 
+// 状态与搜索走后端过滤（搜索覆盖全部分页，而不是只过滤当前已加载页）
+watch(activeTab, () => {
+  void reload()
+})
+let searchTimer: number | undefined
+watch(searchQuery, () => {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => {
+    void reload()
+  }, 300)
+})
+onUnmounted(() => window.clearTimeout(searchTimer))
+
 onMounted(async () => {
   if (isSuperAdmin.value) void loadDeptOptions()
   await reload()
@@ -409,7 +437,7 @@ onMounted(async () => {
               v-for="(article, index) in featuredGroup"
               :key="article.id"
               class="ds-list-item ds-list-item--compact"
-              @click="goEdit(article.id)"
+              @click="openArticle(article)"
             >
               <span class="w-5 shrink-0 text-center font-metric text-body-sm font-semibold text-text-brand tabular-nums">
                 {{ index + 1 }}
@@ -420,7 +448,7 @@ onMounted(async () => {
                   {{ article.department_name }}
                 </p>
               </div>
-              <div class="flex shrink-0 items-center gap-[var(--spacer-2)]" @click.stop>
+              <div v-if="canManageFeatured" class="flex shrink-0 items-center gap-[var(--spacer-2)]" @click.stop>
                 <button
                   type="button"
                   class="ds-list-item__action-btn disabled:opacity-30"
@@ -465,7 +493,7 @@ onMounted(async () => {
             v-for="article in plainArticles"
             :key="article.id"
             class="ds-list-item"
-            @click="goEdit(article.id)"
+            @click="openArticle(article)"
           >
             <span
               class="h-2 w-2 shrink-0 rounded-[var(--radius-full)]"
@@ -497,6 +525,7 @@ onMounted(async () => {
               {{ statusConfig[article.status].label }}
             </span>
             <button
+              v-if="canManage(article)"
               type="button"
               class="ds-list-item__action-btn shrink-0"
               aria-label="更多操作"
@@ -556,6 +585,7 @@ onMounted(async () => {
         </header>
         <div class="flex flex-col">
           <button
+            v-if="actionArticle && canManage(actionArticle)"
             type="button"
             class="ds-menu-row"
             @click="runSheetAction((a) => goEdit(a.id))"
@@ -575,7 +605,7 @@ onMounted(async () => {
             </span>
           </button>
           <button
-            v-if="actionArticle?.status === 'published'"
+            v-if="actionArticle && canManage(actionArticle) && actionArticle.status === 'published'"
             type="button"
             class="ds-menu-row"
             @click="runSheetAction(handleArchive)"
@@ -584,7 +614,7 @@ onMounted(async () => {
             <span class="flex-1 truncate text-left text-body-base text-text">归档</span>
           </button>
           <button
-            v-if="actionArticle?.status === 'archived'"
+            v-if="actionArticle && canManage(actionArticle) && actionArticle.status === 'archived'"
             type="button"
             class="ds-menu-row"
             @click="runSheetAction(handleUnarchive)"
@@ -593,6 +623,7 @@ onMounted(async () => {
             <span class="flex-1 truncate text-left text-body-base text-text">取消归档</span>
           </button>
           <button
+            v-if="actionArticle && canManage(actionArticle)"
             type="button"
             class="ds-menu-row"
             @click="runSheetAction(handleDelete)"

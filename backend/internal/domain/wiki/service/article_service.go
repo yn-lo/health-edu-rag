@@ -446,6 +446,7 @@ func (s *ArticleService) swapFeaturedRank(
 type ListMineInput struct {
 	Status       string // 空 = 全部状态
 	DepartmentID *int64 // 超管可指定；非超管强制为本科室
+	Search       string // 标题/摘要模糊搜索（服务端分页，避免只搜当前页）
 	Actor        Actor
 }
 
@@ -458,7 +459,7 @@ func (s *ArticleService) ListMine(
 		// 避免 WIKI_INVALID_STATUS 同时承载 409/422 两个 HTTP 状态码语义冲突。
 		return nil, 0, apperrors.Validation("WIKI_INVALID_STATUS_PARAM", "status 参数无效")
 	}
-	filter := repository.ListStaffFilter{Status: in.Status}
+	filter := repository.ListStaffFilter{Status: in.Status, Search: in.Search}
 	if in.Actor.Role == constants.RoleSuperAdmin {
 		filter.DepartmentID = in.DepartmentID // nil = 全部
 	} else {
@@ -688,14 +689,27 @@ func patientVisibleFieldChanged(article *entity.Article, in UpdateInput, summary
 	if summary != nil && *summary != article.Summary {
 		return true
 	}
-	if in.ContentRisk == nil {
-		return false
+	if in.ContentRisk != nil {
+		risk := *in.ContentRisk
+		if risk == "" {
+			risk = entity.ContentRiskNormal
+		}
+		if risk != article.ContentRisk {
+			return true
+		}
 	}
-	risk := *in.ContentRisk
-	if risk == "" {
-		risk = entity.ContentRiskNormal
+	// 封面与有效期同样影响患者所见/检索可见性：延长有效期可让过期资料继续被检索命中。
+	if in.CoverImageURL != nil && *in.CoverImageURL != article.CoverImageURL {
+		return true
 	}
-	return risk != article.ContentRisk
+	if in.ClearValidUntil && article.ValidUntil != nil {
+		return true
+	}
+	if in.ValidUntil != nil &&
+		(article.ValidUntil == nil || !in.ValidUntil.Equal(*article.ValidUntil)) {
+		return true
+	}
+	return false
 }
 
 // commitUpdate 事务内落库更新（REQ-WIKI-016/High 3/High 4）：
@@ -730,17 +744,17 @@ func (s *ArticleService) commitUpdate(
 				return fmt.Errorf("outbox insert on update: %w", oErr)
 			}
 		}
-		if fields.ReReviewOnContentChange {
-			if err := s.audit.Create(ctx, &entity.ArticleAuditLog{
-				ArticleID:  a.ID,
-				OperatorID: actor.UserID,
-				Action:     entity.AuditActionUpdate,
-				FromStatus: fromStatus,
-				ToStatus:   a.Status,
-				Summary:    auditSummary(a),
-			}); err != nil {
-				return fmt.Errorf("audit update: %w", err)
-			}
+		// 审计覆盖所有更新，而不只触发重新审核的更新：来源/适用人群/允许引用/封面等元数据
+		// 也影响患者可见面与检索授权，只改这些字段即可绕过审计（P2）。
+		if err := s.audit.Create(ctx, &entity.ArticleAuditLog{
+			ArticleID:  a.ID,
+			OperatorID: actor.UserID,
+			Action:     entity.AuditActionUpdate,
+			FromStatus: fromStatus,
+			ToStatus:   a.Status,
+			Summary:    auditSummary(a),
+		}); err != nil {
+			return fmt.Errorf("audit update: %w", err)
 		}
 		updated = a
 		return nil

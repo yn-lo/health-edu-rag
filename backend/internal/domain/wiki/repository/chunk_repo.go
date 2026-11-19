@@ -214,7 +214,7 @@ func (r *ChunkRepo) SearchByVector(
 		  AND a.published_version > 0
 		  AND c.version = a.published_version
 		  AND (a.status = '%s' OR (a.status = '%s' AND a.published_at IS NOT NULL))
-		  AND (a.valid_until IS NULL OR a.valid_until > now())
+		  AND (a.published_valid_until IS NULL OR a.published_valid_until > now())
 		  AND NOT (a.published_content_risk = '%s' AND a.review_overdue = true)
 		  AND %s
 		  AND %s%s%s

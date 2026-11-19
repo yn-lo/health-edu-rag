@@ -14,6 +14,9 @@ export const ADMIN_ROLES: UserRole[] = ['SUPER_ADMIN', 'DEPT_ADMIN']
 /** 超级管理员角色（限全局系统配置访问） */
 export const SUPER_ADMIN_ROLE: UserRole = 'SUPER_ADMIN'
 
+/** 科室管理员角色（限本科室管理） */
+export const DEPT_ADMIN_ROLE: UserRole = 'DEPT_ADMIN'
+
 /** 医护角色列表 */
 export const STAFF_ROLES: UserRole[] = ['SUPER_ADMIN', 'DEPT_ADMIN', 'DOCTOR', 'NURSE']
 

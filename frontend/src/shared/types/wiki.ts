@@ -118,6 +118,8 @@ export interface ArticleListParams {
 export interface ArticleStaffListParams {
   status?: ArticleStatus;
   department_id?: number;
+  /** 标题/摘要模糊搜索（服务端分页过滤） */
+  search?: string;
   page?: number;
   page_size?: number;
 }
@@ -166,6 +168,8 @@ export interface ReferenceApplyRequest {
 export interface ReferenceListParams {
   status?: ReferenceStatus;
   direction?: 'outgoing' | 'incoming';
+  /** 文章标题/科室名模糊搜索（服务端分页过滤） */
+  search?: string;
   page?: number;
   page_size?: number;
 }

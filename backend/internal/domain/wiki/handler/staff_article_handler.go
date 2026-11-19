@@ -96,6 +96,7 @@ func (h *StaffArticleHandler) List(w http.ResponseWriter, r *http.Request) {
 	items, total, err := h.svc.ListMine(r.Context(), service.ListMineInput{
 		Status:       r.URL.Query().Get("status"),
 		DepartmentID: deptID,
+		Search:       r.URL.Query().Get("search"),
 		Actor:        actor,
 	}, p.PageSize, p.Offset())
 	if err != nil {

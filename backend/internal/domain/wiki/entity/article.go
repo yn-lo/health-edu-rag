@@ -29,19 +29,23 @@ type Article struct {
 	PublishedTitle       string
 	PublishedSummary     string
 	PublishedContentRisk string
-	AuthorID             int64
-	DepartmentID         *int64
-	ReviewerID           *int64
-	ReviewComment        string
-	ViewCount            int64
-	FeaturedRank         int
-	IsDeleted            bool
-	AllowReference       bool
-	ReviewOverdue        bool
-	ReviewOverdueAt      *time.Time
-	PublishedAt          *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// PublishedCoverImageURL/PublishedValidUntil 同属已发布快照：
+	// 患者详情读封面、检索读有效期，若读编辑稿则改封面/延长有效期可绕过审核生效（P1）。
+	PublishedCoverImageURL string
+	PublishedValidUntil    *time.Time
+	AuthorID               int64
+	DepartmentID           *int64
+	ReviewerID             *int64
+	ReviewComment          string
+	ViewCount              int64
+	FeaturedRank           int
+	IsDeleted              bool
+	AllowReference         bool
+	ReviewOverdue          bool
+	ReviewOverdueAt        *time.Time
+	PublishedAt            *time.Time
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 
 	// 知识条目元数据（P1）：来源 / 适用人群 / 有效期 / 内容风险等级。
 	// ContentRisk 决定逾期策略与检索可见性：high 的资料有效期更短，

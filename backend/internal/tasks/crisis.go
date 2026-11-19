@@ -8,6 +8,7 @@ import (
 	baseentity "health-edu-rag/internal/domain/base/entity"
 	baserepo "health-edu-rag/internal/domain/base/repository"
 	chatrepo "health-edu-rag/internal/domain/chat/repository"
+	"health-edu-rag/internal/platform/postgres"
 	"health-edu-rag/internal/shared/constants"
 )
 
@@ -66,6 +67,13 @@ func (n *CrisisNotifier) Notify(ctx context.Context, payload []byte) error {
 		return nil
 	}
 	if err := n.notifications.Create(ctx, notification); err != nil {
+		// 并发路径（快速路径 + outbox 补投）同时通过 ExistsForRef 时，由唯一索引兜底：
+		// 23505 表示已投递，按成功处理，不触发任务重试。
+		if postgres.IsUniqueViolation(err) {
+			slog.InfoContext(ctx, "chat: crisis notification already exists, skip",
+				"event_id", eventID, "role", notification.RecipientRole)
+			return nil
+		}
 		slog.ErrorContext(ctx, "chat: crisis notify insert failed", "event_id", eventID, "err", err)
 		return err
 	}
@@ -98,8 +106,10 @@ func (n *CrisisNotifier) Escalate(ctx context.Context) error {
 		}
 		if !exists {
 			if cerr := n.notifications.Create(ctx, notification); cerr != nil {
-				slog.ErrorContext(ctx, "chat: crisis escalation notify failed", "event_id", o.ID, "err", cerr)
-				continue
+				if !postgres.IsUniqueViolation(cerr) {
+					slog.ErrorContext(ctx, "chat: crisis escalation notify failed", "event_id", o.ID, "err", cerr)
+					continue
+				}
 			}
 		}
 		ok, merr := n.crisis.MarkEscalated(ctx, o.ID)

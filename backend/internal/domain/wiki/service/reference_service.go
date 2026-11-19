@@ -270,6 +270,7 @@ func (s *ReferenceService) createReference(ctx context.Context, ref *entity.Arti
 type ListInput struct {
 	Status    string // 空 = 全部
 	Direction string // outgoing/incoming/空=两者
+	Search    string // 文章标题/科室名模糊搜索
 	Actor     Actor
 }
 
@@ -283,7 +284,7 @@ func (s *ReferenceService) List(ctx context.Context, in ListInput, limit, offset
 		in.Direction != constants.ReferenceDirectionIncoming {
 		return nil, 0, apperrors.Validation("WIKI_REF_INVALID_DIRECTION", "direction 参数无效")
 	}
-	f := repository.ListFilter{Status: in.Status, Direction: in.Direction}
+	f := repository.ListFilter{Status: in.Status, Direction: in.Direction, Search: in.Search}
 	if in.Actor.Role != constants.RoleSuperAdmin {
 		f.CurrentDept = in.Actor.DeptID
 		deptIDs := []int64{in.Actor.DeptID}

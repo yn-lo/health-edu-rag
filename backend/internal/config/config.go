@@ -24,17 +24,34 @@ const (
 	EnvProduction  = "production"
 )
 
-// WarnIfDevSecrets 安全密钥仍为开发占位值或为空时输出 ERROR 级启动告警。
-// 不阻断启动：本地开发依赖 config.yaml 的 dev 值。
-// ponytail: 告警而非 panic——强拒绝会破坏本地开发流（air/make run 直接用 config.yaml）；
-// 上限——依赖部署者看到告警后注入环境变量。升级路径：引入显式运行模式（如 RUN_MODE=production）后改为 panic。
-func WarnIfDevSecrets(cfg *Config) {
-	if cfg.JWT.Secret == "" || cfg.JWT.Secret == DevJWTSecret {
-		slog.Error("SECURITY: jwt.secret 为空或仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_JWT_SECRET 覆盖（否则可被离线伪造任意身份令牌）")
+// ValidateSecrets 校验安全密钥：
+//   - development：仍为占位值/空值时输出 ERROR 告警，不阻断本地开发；
+//   - production：必须使用非占位且足够长度的密钥，否则拒绝启动（fail-closed）。
+//
+// 生产必须显式设置 HEALTH_EDU_RAG_ENV=production；docker-compose 默认即为 production。
+// 这样即使环境变量漏注入、回落到仓库内 config.yaml 的公开 dev 密钥，也不会带病启动。
+func ValidateSecrets(cfg *Config) error {
+	if cfg.IsDevelopment() {
+		if cfg.JWT.Secret == "" || cfg.JWT.Secret == DevJWTSecret {
+			slog.Error("SECURITY: jwt.secret 为空或仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_JWT_SECRET 覆盖（否则可被离线伪造任意身份令牌）")
+		}
+		if cfg.Security.EncryptionKey == "" || cfg.Security.EncryptionKey == DevEncryptionKey {
+			slog.Error("SECURITY: security.encryption_key 为空或仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY 覆盖")
+		}
+		return nil
 	}
-	if cfg.Security.EncryptionKey == DevEncryptionKey {
-		slog.Error("SECURITY: security.encryption_key 仍是开发占位值，生产环境必须通过 HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY 覆盖")
+	if weakSecret(cfg.JWT.Secret, DevJWTSecret, 32) {
+		return fmt.Errorf("SECURITY: production requires HEALTH_EDU_RAG_JWT_SECRET with at least 32 chars and no known placeholder")
 	}
+	if weakSecret(cfg.Security.EncryptionKey, DevEncryptionKey, 16) {
+		return fmt.Errorf("SECURITY: production requires HEALTH_EDU_RAG_SECURITY_ENCRYPTION_KEY with at least 16 chars and no known placeholder")
+	}
+	return nil
+}
+
+// weakSecret 空值、已知占位值、常见模板占位前缀或长度不足均视为弱密钥。
+func weakSecret(v, devPlaceholder string, minLen int) bool {
+	return v == "" || v == devPlaceholder || strings.HasPrefix(v, "change-me") || len(v) < minLen
 }
 
 // 配置默认值（供 setDefaults 注册到 viper）。

@@ -2,20 +2,21 @@
 /**
  * 跨科室引用管理 — 公开文章直接引用版
  * API: wikiApi.applyReference/listReferences/revokeReference
- * 设计原则：移动优先、公开文章免审批直接引用、源文章变动提示
+ * 设计原则：移动优先、引用申请需源科室管理员审批、源文章变动提示
  */
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Plus, Ban, Search, ArrowRightLeft,
   FileText, Building2, Clock, User,
-  AlertTriangle,
+  AlertTriangle, Check, X,
 } from '@lucide/vue'
 import { useDsToast, useDsDialog } from '@/shared/composables'
 import { AppHeader, PageShell, EmptyState, DsPopup } from '@/shared/components'
 import { wikiApi, fmtDateTime, timeAgo } from '@/shared'
 import { errmsg } from '@/shared/api/client'
 import { useAuthStore } from '@/stores/auth'
+import { ADMIN_ROLES, SUPER_ADMIN_ROLE } from '@/shared/constants/roles'
 import type { ArticleReference, ReferenceStatus, ArticlePublic } from '@/shared'
 
 const router = useRouter()
@@ -23,34 +24,56 @@ const authStore = useAuthStore()
 const { showSuccessToast, showFailToast } = useDsToast()
 const { showConfirmDialog } = useDsDialog()
 
+/** 仅科室管理员/超管可审批、撤销（后端 assertCanReviewReference 强校验）。 */
+const canReview = computed(() => Boolean(authStore.user && ADMIN_ROLES.includes(authStore.user.role)))
+/** 超管无主科室：后端不按方向过滤，UI 需展示双向信息并隐藏方向统计。 */
+const isSuperAdmin = computed(() => authStore.user?.role === SUPER_ADMIN_ROLE)
+
 // ===== 列表数据 =====
 const references = ref<ArticleReference[]>([])
 const total = ref(0)
 const loading = ref(false)
 const search = ref('')
-const filterStatus = ref<'approved' | 'revoked' | 'all'>('all')
+const filterStatus = ref<'pending' | 'approved' | 'rejected' | 'revoked' | 'all'>('all')
 const filterDirection = ref<'outgoing' | 'incoming'>('outgoing')
 const page = ref(1)
 const PAGE_SIZE = 20
+
+// 搜索走后端过滤（覆盖全部分页）；防抖避免逐字请求。
+let searchTimer: number | undefined
+watch(search, () => {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => {
+    page.value = 1
+    void load()
+  }, 300)
+})
+onUnmounted(() => window.clearTimeout(searchTimer))
 
 // ===== 统计 =====
 const approvedCount = ref(0)
 const incomingCount = ref(0)
 
 // ===== 状态胶囊 =====
-const statusChips: { value: 'approved' | 'revoked' | 'all'; label: string }[] = [
+const statusChips: { value: 'pending' | 'approved' | 'rejected' | 'revoked' | 'all'; label: string }[] = [
   { value: 'all', label: '全部' },
+  { value: 'pending', label: '待审批' },
   { value: 'approved', label: '已引用' },
+  { value: 'rejected', label: '已驳回' },
   { value: 'revoked', label: '已撤销' },
 ]
 
 const statusLabel: Record<string, string> = {
+  pending: '待审批',
   approved: '已引用',
+  rejected: '已驳回',
   revoked: '已撤销',
 }
 
 const statusTagVariant: Record<string, string> = {
+  pending: 'ds-tag--warning',
   approved: 'ds-tag--success',
+  rejected: 'ds-tag--default',
   revoked: 'ds-tag--default',
 }
 
@@ -66,28 +89,35 @@ function sourceArticleWarning(status: string): string {
 }
 
 // ===== 加载列表 =====
+/** 请求序号：搜索/翻页/筛选并发时丢弃过期响应，避免旧页覆盖新页。 */
+let loadSeq = 0
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   try {
     const params: {
       status?: ReferenceStatus
       direction: 'outgoing' | 'incoming'
+      search?: string
       page: number
       page_size: number
     } = { direction: filterDirection.value, page: page.value, page_size: PAGE_SIZE }
     if (filterStatus.value !== 'all') params.status = filterStatus.value
+    if (search.value.trim()) params.search = search.value.trim()
     const res = await wikiApi.listReferences(params)
+    if (seq !== loadSeq) return
     references.value = res.items
     total.value = res.total
   } catch (e) {
-    showFailToast(errmsg(e, '加载失败'))
+    if (seq === loadSeq) showFailToast(errmsg(e, '加载失败'))
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
-/** 加载统计 */
+/** 加载统计（超管无方向语义，跳过无效请求） */
 async function loadStats() {
+  if (isSuperAdmin.value) return
   try {
     const [outRes, inRes] = await Promise.all([
       wikiApi.listReferences({ direction: 'outgoing', status: 'approved', page: 1, page_size: 1 }),
@@ -107,7 +137,7 @@ function onDirectionChange(dir: 'outgoing' | 'incoming') {
   load()
 }
 
-function onStatusChange(status: 'approved' | 'revoked' | 'all') {
+function onStatusChange(status: 'pending' | 'approved' | 'rejected' | 'revoked' | 'all') {
   filterStatus.value = status
   page.value = 1
   load()
@@ -170,7 +200,7 @@ async function selectAndApply(a: ArticlePublic) {
       article_id: a.id,
       target_dept_id: deptId,
     })
-    showSuccessToast('引用成功')
+    showSuccessToast('引用申请已提交，等待源科室审批')
     showArticlePicker.value = false
     await Promise.all([load(), loadStats()])
   } catch (e) {
@@ -185,7 +215,7 @@ async function revoke(r: ArticleReference) {
   try {
     await showConfirmDialog({
       title: '撤销引用',
-      message: `撤销引用「${r.article_title}」？撤销后本科室将无法继续引用该文章。`,
+      message: `撤销「${r.article_title}」对「${r.target_dept_name}」的引用授权？撤销后该科室将无法继续引用。`,
       confirmButtonText: '撤销',
       danger: true,
       cancelButtonText: '取消',
@@ -196,6 +226,49 @@ async function revoke(r: ArticleReference) {
   try {
     await wikiApi.revokeReference(r.id)
     showSuccessToast('已撤销')
+    await Promise.all([load(), loadStats()])
+  } catch (e) {
+    showFailToast(errmsg(e, '操作失败'))
+  }
+}
+
+// ===== 审批（仅源科室管理员可操作，后端强校验） =====
+async function approve(r: ArticleReference) {
+  try {
+    await showConfirmDialog({
+      title: '通过引用申请',
+      message: `允许「${r.target_dept_name}」引用「${r.article_title}」？`,
+      confirmButtonText: '通过',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await wikiApi.approveReference(r.id)
+    showSuccessToast('已通过')
+    await Promise.all([load(), loadStats()])
+  } catch (e) {
+    showFailToast(errmsg(e, '操作失败'))
+  }
+}
+
+async function reject(r: ArticleReference) {
+  try {
+    await showConfirmDialog({
+      title: '驳回引用申请',
+      message: `驳回「${r.target_dept_name}」对「${r.article_title}」的引用申请？`,
+      confirmButtonText: '驳回',
+      danger: true,
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    // 后端 reason 必填：使用固定原因，避免弹出输入组件破坏当前交互。
+    await wikiApi.rejectReference(r.id, '源科室未同意引用')
+    showSuccessToast('已驳回')
     await Promise.all([load(), loadStats()])
   } catch (e) {
     showFailToast(errmsg(e, '操作失败'))
@@ -230,6 +303,7 @@ onMounted(() => {
     <AppHeader title="跨科室引用" @back="router.back">
       <template #right>
         <button
+          v-if="!isSuperAdmin"
           type="button"
           class="ds-icon-btn ds-icon-btn--sm ds-icon-btn--brand"
           aria-label="引用文章"
@@ -240,9 +314,12 @@ onMounted(() => {
       </template>
     </AppHeader>
 
-    <!-- 统计概览 -->
+    <!-- 统计概览（超管无方向语义，改为显示总数） -->
     <div class="px-[var(--spacer-16)] pt-[var(--spacer-16)]">
-      <div class="grid grid-cols-2 gap-[var(--spacer-12)]">
+      <div v-if="isSuperAdmin" class="rounded-[var(--radius-card-medium)] bg-[var(--bg-brand-light)] p-[var(--spacer-16)] text-body-md text-text-brand">
+        共 {{ total }} 条{{ search || filterStatus !== 'all' ? '（当前筛选）' : '引用记录' }}
+      </div>
+      <div v-else class="grid grid-cols-2 gap-[var(--spacer-12)]">
         <button
           type="button"
           class="flex items-center gap-[var(--spacer-12)] rounded-[var(--radius-card-medium)] p-[var(--spacer-16)] text-left transition-colors"
@@ -268,7 +345,7 @@ onMounted(() => {
             <div
               class="mt-[var(--spacer-4)] text-body-sm"
               :class="filterDirection === 'outgoing' ? 'text-onbrand opacity-75' : 'text-text-secondary'"
-            >我引用的</div>
+            >被引用的</div>
           </div>
         </button>
         <button
@@ -296,7 +373,7 @@ onMounted(() => {
             <div
               class="mt-[var(--spacer-4)] text-body-sm"
               :class="filterDirection === 'incoming' ? 'text-onbrand opacity-75' : 'text-text-secondary'"
-            >被引用的</div>
+            >我引用的</div>
           </div>
         </button>
       </div>
@@ -311,7 +388,6 @@ onMounted(() => {
           type="text"
           placeholder="搜索文章 / 科室"
           class="ds-search-box__input"
-          @input="page = 1; load()"
         >
       </div>
 
@@ -335,7 +411,7 @@ onMounted(() => {
       <div v-if="references.length === 0 && loading" class="py-[var(--spacer-32)] text-center text-body-md text-text-tertiary">
         加载中...
       </div>
-      <EmptyState v-else-if="references.length === 0" :text="filterDirection === 'outgoing' ? '暂无引用记录，点击右上角 + 引用公开文章' : '暂无被引用记录'" />
+      <EmptyState v-else-if="references.length === 0" :text="search ? '没有匹配的引用记录' : (filterDirection === 'outgoing' ? '暂无被引用记录' : '暂无引用记录，点击右上角 + 引用公开文章')" />
       <div v-else class="ds-list rounded-[var(--radius-card-large)] bg-[var(--bg-base-default)] overflow-hidden">
         <article
           v-for="r in references"
@@ -362,13 +438,18 @@ onMounted(() => {
               </span>
             </span>
             <span class="ds-list-item__meta">
-              <template v-if="filterDirection === 'outgoing'">
-                <span>引用自</span>
+              <template v-if="isSuperAdmin">
                 <span class="text-text-brand font-medium">{{ r.source_dept_name }}</span>
+                <span>→</span>
+                <span class="text-text-brand font-medium">{{ r.target_dept_name }}</span>
               </template>
-              <template v-else>
+              <template v-else-if="filterDirection === 'outgoing'">
                 <span class="text-text-brand font-medium">{{ r.target_dept_name }}</span>
                 <span>引用了本文</span>
+              </template>
+              <template v-else>
+                <span>引用自</span>
+                <span class="text-text-brand font-medium">{{ r.source_dept_name }}</span>
               </template>
               <span>· {{ r.applicant_name }}</span>
               <span>· {{ timeAgo(r.created_at) }}</span>
@@ -376,8 +457,26 @@ onMounted(() => {
           </div>
           <div class="ds-list-item__trailing" @click.stop>
             <span class="ds-tag ds-tag--plain" :class="statusTagVariant[r.status] ?? 'ds-tag--default'">{{ statusLabel[r.status] ?? r.status }}</span>
+            <template v-if="canReview && r.status === 'pending' && (isSuperAdmin || filterDirection === 'outgoing')">
+              <button
+                type="button"
+                class="ds-list-item__action-btn"
+                aria-label="通过"
+                @click="approve(r)"
+              >
+                <Check :size="16" />
+              </button>
+              <button
+                type="button"
+                class="ds-list-item__action-btn"
+                aria-label="驳回"
+                @click="reject(r)"
+              >
+                <X :size="16" />
+              </button>
+            </template>
             <button
-              v-if="r.status === 'approved' && filterDirection === 'outgoing'"
+              v-else-if="canReview && r.status === 'approved' && (isSuperAdmin || filterDirection === 'outgoing')"
               type="button"
               class="ds-list-item__action-btn"
               aria-label="撤销"
@@ -444,6 +543,11 @@ onMounted(() => {
             <span class="ml-auto text-body-sm font-medium text-text">{{ detailRef.source_dept_name }}</span>
           </div>
           <div class="flex items-center gap-[var(--spacer-8)]">
+            <Building2 class="shrink-0 w-4 h-4 text-icon-tertiary" />
+            <span class="text-body-sm text-text-tertiary">目标科室</span>
+            <span class="ml-auto text-body-sm font-medium text-text">{{ detailRef.target_dept_name }}</span>
+          </div>
+          <div class="flex items-center gap-[var(--spacer-8)]">
             <User class="shrink-0 w-4 h-4 text-icon-tertiary" />
             <span class="text-body-sm text-text-tertiary">操作人</span>
             <span class="ml-auto text-body-sm text-text">{{ detailRef.applicant_name }}</span>
@@ -456,7 +560,11 @@ onMounted(() => {
         </div>
 
         <!-- 操作按钮 -->
-        <div v-if="detailRef.status === 'approved' && filterDirection === 'outgoing'" class="mt-[var(--spacer-16)]">
+        <div v-if="canReview && detailRef.status === 'pending' && (isSuperAdmin || filterDirection === 'outgoing')" class="mt-[var(--spacer-16)] flex gap-[var(--spacer-8)]">
+          <button type="button" class="ds-btn ds-btn--primary ds-btn--block" @click="showDetail = false; approve(detailRef!)">通过</button>
+          <button type="button" class="ds-btn ds-btn--danger-outline ds-btn--block" @click="showDetail = false; reject(detailRef!)">驳回</button>
+        </div>
+        <div v-else-if="canReview && detailRef.status === 'approved' && (isSuperAdmin || filterDirection === 'outgoing')" class="mt-[var(--spacer-16)]">
           <button type="button" class="ds-btn ds-btn--danger-outline ds-btn--block" @click="showDetail = false; revoke(detailRef!)">撤销引用</button>
         </div>
         <div v-else class="mt-[var(--spacer-16)]">

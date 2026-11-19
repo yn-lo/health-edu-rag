@@ -643,8 +643,13 @@ func (s *AuthService) CreateAccount(
 	if err := validatePasswordStrength(password); err != nil {
 		return nil, err
 	}
-	// 非超管只能给本科室绑定科室（防跨科室越权）。
-	if actorRole != constants.RoleSuperAdmin && deptID != 0 && deptID != actorDeptID {
+	// 医护/科室管理员必须绑定具体科室：deptID=0 会生成无科室账户，
+	// 其数据隔离与科室检索范围失效（P2：无科室账户曾导致跨科室越权）。
+	if deptID <= 0 && (role == constants.RoleDeptAdmin || role == constants.RoleDoctor || role == constants.RoleNurse) {
+		return nil, apperrors.Validation("AUTH_DEPT_REQUIRED", "该角色必须绑定科室")
+	}
+	// 非超管只能给本科室绑定科室（防跨科室越权）；0 不再视为合法绕过。
+	if actorRole != constants.RoleSuperAdmin && deptID != actorDeptID {
 		return nil, apperrors.Forbidden("AUTH_FORBIDDEN_DEPT", "只能绑定本科室")
 	}
 	hash, err := crypto.HashPassword(password, s.cfg.Argon2)
@@ -821,6 +826,13 @@ func (s *AuthService) UpdateAccountRole(
 	}
 	if target == nil {
 		return nil, apperrors.NotFound("AUTH_USER_NOT_FOUND", "用户不存在")
+	}
+	// 与 CreateAccount 的不变量一致：医护/科室管理员必须有主科室，
+	// 否则患者转医护会得到无科室账户，数据隔离与检索范围失效。
+	if newRole == constants.RoleDeptAdmin || newRole == constants.RoleDoctor || newRole == constants.RoleNurse {
+		if target.PrimaryDeptID <= 0 {
+			return nil, apperrors.Validation("AUTH_DEPT_REQUIRED", "该角色必须绑定科室")
+		}
 	}
 	if err := s.repo.UpdateRole(ctx, targetID, newRole); err != nil {
 		return nil, fmt.Errorf("update role: %w", err)

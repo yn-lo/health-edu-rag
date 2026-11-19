@@ -29,6 +29,10 @@ type DepartmentRepo interface {
 	ListDescendantIDs(ctx context.Context, rootID int64) ([]int64, error)
 	HasChildren(ctx context.Context, id int64) (bool, error)
 	HasUsers(ctx context.Context, id int64) (bool, error)
+	HasArticles(ctx context.Context, id int64) (bool, error)
+	HasReferences(ctx context.Context, id int64) (bool, error)
+	DeleteClosedReferences(ctx context.Context, id int64) error
+	LockByID(ctx context.Context, id int64) (bool, error)
 	SiblingNameExists(ctx context.Context, name string, parentID *int64, excludeID int64) (bool, error)
 	Create(ctx context.Context, d *entity.Department) error
 	UpdateFields(ctx context.Context, id int64, fields map[string]any) (*entity.Department, error)
@@ -378,25 +382,51 @@ func (s *DepartmentService) Delete(ctx context.Context, id int64, actor Actor) (
 		return false, apperrors.NotFound("BASE_DEPT_NOT_FOUND", "科室不存在")
 	}
 
-	hasChildren, err := s.repo.HasChildren(ctx, id)
-	if err != nil {
-		return false, fmt.Errorf("check children: %w", err)
-	}
-	if hasChildren {
-		return false, apperrors.Conflict("BASE_DEPT_HAS_CHILDREN", "该科室仍有子科室，请先迁移或删除子科室")
-	}
-	hasUsers, err := s.repo.HasUsers(ctx, id)
-	if err != nil {
-		return false, fmt.Errorf("check users: %w", err)
-	}
-	if hasUsers {
-		return false, apperrors.Conflict("BASE_DEPT_HAS_USERS", "该科室仍有用户关联，请先迁移用户")
-	}
-
+	// 所有关联检查与删除在同一事务内，并先锁定科室行：
+	// 与并发新增文章/子科室/用户关联串行化，避免"检查通过后并发写入"造成孤儿数据。
 	if err := s.runTx(ctx, func(ctx context.Context) error {
+		locked, lerr := s.repo.LockByID(ctx, id)
+		if lerr != nil {
+			return fmt.Errorf("lock department: %w", lerr)
+		}
+		if !locked {
+			return apperrors.NotFound("BASE_DEPT_NOT_FOUND", "科室不存在")
+		}
+		hasChildren, cerr := s.repo.HasChildren(ctx, id)
+		if cerr != nil {
+			return fmt.Errorf("check children: %w", cerr)
+		}
+		if hasChildren {
+			return apperrors.Conflict("BASE_DEPT_HAS_CHILDREN", "该科室仍有子科室，请先迁移或删除子科室")
+		}
+		hasUsers, uerr := s.repo.HasUsers(ctx, id)
+		if uerr != nil {
+			return fmt.Errorf("check users: %w", uerr)
+		}
+		if hasUsers {
+			return apperrors.Conflict("BASE_DEPT_HAS_USERS", "该科室仍有用户关联，请先迁移用户")
+		}
+		hasArticles, aerr := s.repo.HasArticles(ctx, id)
+		if aerr != nil {
+			return fmt.Errorf("check articles: %w", aerr)
+		}
+		if hasArticles {
+			return apperrors.Conflict("BASE_DEPT_HAS_ARTICLES", "该科室仍有未删除文章，请先删除或迁移文章")
+		}
+		hasRefs, rerr := s.repo.HasReferences(ctx, id)
+		if rerr != nil {
+			return fmt.Errorf("check references: %w", rerr)
+		}
+		if hasRefs {
+			return apperrors.Conflict("BASE_DEPT_HAS_REFERENCES", "该科室仍有跨科室引用关联，请先撤销引用")
+		}
+		// rejected/revoked 历史记录仍受外键约束，删除科室前先清理。
+		if derr := s.repo.DeleteClosedReferences(ctx, id); derr != nil {
+			return derr
+		}
 		return s.repo.Delete(ctx, id)
 	}); err != nil {
-		return false, fmt.Errorf("delete department: %w", err)
+		return false, err
 	}
 	return true, nil
 }

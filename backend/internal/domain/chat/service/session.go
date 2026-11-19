@@ -219,9 +219,12 @@ func (d *dbSessionStore) PersistCrisis(
 	// crisis 事件高价值（医护端需感知），瞬时 DB 故障不应静默漏报：有界重试 1 次；ctx 取消不重试。
 	const crisisPersistRetries = 1
 	var crisisEventID int64
+	// 危机轮同样需要锁定科室：否则首轮即自伤（尚未选科室/前端异步加载中）的会话保持
+	// locked_dept_id=NULL，通知只会投给超管，责任科室医护不可见（P1 漏接单）。
+	lockDept := d.pendingLockDept(in.DeptID)
 	persist := func(ctx context.Context) error {
 		return d.tx.WithTx(ctx, func(ctx context.Context) error {
-			userMsg, err := d.saveUserInTx(ctx, in.Content, in.TurnID, nil)
+			userMsg, err := d.saveUserInTx(ctx, in.Content, in.TurnID, lockDept)
 			if err != nil {
 				return err
 			}
@@ -263,6 +266,9 @@ func (d *dbSessionStore) PersistCrisis(
 			"patient_id", patientID, "conversation_id", d.convEntity.ID,
 			"keywords", c.Keywords, "err", err)
 		return uuid.Nil, uuid.Nil, err
+	}
+	if lockDept != nil {
+		d.convEntity.LockedDeptID = lockDept
 	}
 	slog.InfoContext(ctx, "chat crisis event created",
 		"event_id", crisisEventID, "patient_id", patientID, "conversation_id", d.convEntity.ID, "keywords", c.Keywords)
@@ -396,7 +402,9 @@ func (m *memSessionStore) SetAssistantPromptMeta(
 	return nil
 }
 
-// PersistCrisis 匿名实现：不汇报不记录，返回零值 ID（链路上已下发心理援助热线）。
+// PersistCrisis 匿名实现：不汇报、不记录、不通知医护，返回零值 ID。
+// 必须与 AnonymousCrisisNote（"不会转交医护人员，也不会留下记录"）保持一致：
+// 即使写入的是 12h 瞬态 Redis 环，也属于"留下记录"，与对患者的承诺冲突。
 func (m *memSessionStore) PersistCrisis(
 	context.Context, int64, TurnWrite, *rag.Crisis, string,
 ) (userMsgID, assistantMsgID uuid.UUID, err error) {
@@ -405,15 +413,24 @@ func (m *memSessionStore) PersistCrisis(
 
 // push 序列化消息追加到环、裁剪为有界长度并刷新 TTL。
 func (m *memSessionStore) push(ctx context.Context, mf *entity.Message) error {
+	return m.pushMany(ctx, mf)
+}
+
+// pushMany 原子追加多条消息（同一 RPush），再裁剪与续期；用于一轮 user+assistant 同时入环。
+func (m *memSessionStore) pushMany(ctx context.Context, msgs ...*entity.Message) error {
 	if m.ring == nil {
 		// 无 Redis 环（如测试）时退化为单轮：不持久化（历史为空，逻辑等价旧匿名行为）。
 		return nil
 	}
-	data, err := json.Marshal(mf)
-	if err != nil {
-		return err
+	values := make([]string, 0, len(msgs))
+	for _, mf := range msgs {
+		data, err := json.Marshal(mf)
+		if err != nil {
+			return err
+		}
+		values = append(values, string(data))
 	}
-	if err := m.ring.RPush(ctx, m.key, string(data)); err != nil {
+	if err := m.ring.RPush(ctx, m.key, values...); err != nil {
 		return fmt.Errorf("anon ring push: %w", err)
 	}
 	// LTrim 保留尾部 anonymousMaxMessages 条：列表长度有界，避免持续使用无限增长；

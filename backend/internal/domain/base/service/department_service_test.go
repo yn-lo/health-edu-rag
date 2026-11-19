@@ -123,6 +123,22 @@ func (m *mockDeptRepo) HasUsers(_ context.Context, id int64) (bool, error) {
 	return m.hasUsersMap[id], nil
 }
 
+func (m *mockDeptRepo) HasArticles(_ context.Context, _ int64) (bool, error) {
+	return false, nil
+}
+
+func (m *mockDeptRepo) HasReferences(_ context.Context, _ int64) (bool, error) {
+	return false, nil
+}
+
+func (m *mockDeptRepo) DeleteClosedReferences(_ context.Context, _ int64) error {
+	return nil
+}
+
+func (m *mockDeptRepo) LockByID(_ context.Context, _ int64) (bool, error) {
+	return true, nil
+}
+
 func (m *mockDeptRepo) SiblingNameExists(_ context.Context, _ string, _ *int64, _ int64) (bool, error) {
 	return false, nil
 }

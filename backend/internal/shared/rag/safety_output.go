@@ -54,11 +54,27 @@ type OutputSafetyFilter interface {
 }
 
 var (
-	diagnosisRe          = regexp.MustCompile(`(?:(?:确诊|诊断)为|(?:初步)?(?:诊断|确诊)[是为：:]\s*[^，。；\s]+)`)
-	prescriptionRe       = regexp.MustCompile(`(?:建议(?:服|用|服用|吃)\s*[^，。；\s]+\s*(?:片|丸|胶囊|药|mg|克))`)
-	stopMedicationRe     = regexp.MustCompile(`(?:建议(?:立即)?(?:停[药服止]|停止服药))`)
-	delayMedicalRe       = regexp.MustCompile(`(?:不建议(?:去|到)?(?:医院|就医)|不需要(?:去)?(?:医院|就医))`)
-	medicationMentionRe  = regexp.MustCompile(`(?:\d+\s*(?:mg|克|片|丸|胶囊)|剂量|用量|每日.*次)`)
+	diagnosisRe = regexp.MustCompile(`(?:(?:确诊|诊断)为|(?:初步)?(?:诊断|确诊)[是为：:]\s*[^，。；\s]+)`)
+	// prescriptionRe 只匹配明确的推荐用药句式：
+	//  1) 建议服用/口服/使用 + ≥2 字药名 + 剂型/剂量单位（不含裸"药"，避免"药膳"被截断）；
+	//  2) 建议服用/口服/使用/吃 + 常见药物名或药物类别后缀。
+	prescriptionRe = regexp.MustCompile(
+		`(?:(?:建议|可以|可|推荐|应|需要|请(?:您)?)[^，。；\s]{0,4}(?:口服|服用|使用|吃|用)|` +
+			`(?:请(?:您)?|建议|可以|可|推荐)\s*(?:改用|换用|换成|加用))` +
+			`\s*[^，。；\s]{2,}\s*(?:片|丸|胶囊|mg|散|颗粒|糖浆|滴剂|喷雾|软膏|乳膏|栓|贴|注射液|口服液|含片|滴眼液|气雾剂|凝胶|酊|洗剂|露)` +
+			`|` +
+			`(?:(?:建议|可以|可|推荐|应|需要|请(?:您)?)[^，。；\s]{0,4}(?:口服|服用|使用|吃|用)|` +
+			`(?:请(?:您)?|建议|可以|可|推荐)\s*(?:改用|换用|换成|加用))` +
+			`\s*[^，。；\s]{0,12}` +
+			`(?:布洛芬|阿司匹林|对乙酰氨基酚|胰岛素|二甲双胍|硝苯地平|氨氯地平|华法林|氯吡格雷|头孢|青霉素|抗生素|激素|` +
+			`藿香正气水|云南白药|开塞露|` +
+			`西林|霉素|沙星|拉唑|洛尔|普利|沙坦|他汀|补液盐|他定|唑|胺|酮|芬|灵|格雷)`)
+	stopMedicationRe    = regexp.MustCompile(`(?:建议(?:立即)?(?:停[药服止]|停止服药))`)
+	delayMedicalRe      = regexp.MustCompile(`(?:不建议(?:去|到)?(?:医院|就医)|不需要(?:去)?(?:医院|就医))`)
+	medicationMentionRe = regexp.MustCompile(
+		`(?:(?:\d+|[一二两三四五六七八九十]+)\s*(?:mg|毫克)|` +
+			`(?:剂量|用量|每次)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十]+)\s*(?:克|g|ml|毫升|片|粒)|` +
+			`剂量|用量)`)
 	diagnosisExceptionRe = regexp.MustCompile(`(?:无法确诊|不能确诊|建议.*确诊|请.*医生.*确诊|疑似|诊断为准)`)
 )
 
@@ -193,6 +209,11 @@ func (f *DefaultOutputSafetyFilter) Validate(ctx context.Context, answer string)
 				continue
 			}
 			loc := rule.Re.FindStringIndex(answer)
+			if category == "prescription" {
+				// 逐条命中判定：同一答案可能同时含"不建议服用A，建议服用B"。
+				// 只检查首个命中会把后半句真实处方放行。
+				loc = findFirstUnnegated(rule.Re, answer)
+			}
 			if loc == nil {
 				continue
 			}
@@ -210,7 +231,14 @@ func (f *DefaultOutputSafetyFilter) Validate(ctx context.Context, answer string)
 
 	final := answer
 	for _, rule := range matched {
-		if next := rule.Re.ReplaceAllString(final, rule.Replacement); next != final {
+		var next string
+		if rule.Category == "prescription" {
+			// 只替换非否定的处方命中，保留"不建议服用…"这类安全提醒原文。
+			next = replaceUnnegated(rule.Re, final, rule.Replacement)
+		} else {
+			next = rule.Re.ReplaceAllString(final, rule.Replacement)
+		}
+		if next != final {
 			final = next
 		}
 	}
@@ -226,6 +254,77 @@ func (f *DefaultOutputSafetyFilter) Validate(ctx context.Context, answer string)
 		return OutputResult{Final: final, Changed: final != answer}
 	}
 	return OutputResult{Final: answer}
+}
+
+// findFirstUnnegated 返回第一个未被否定词修饰的匹配位置；全部命中均被否定时返回 nil。
+func findFirstUnnegated(re *regexp.Regexp, answer string) []int {
+	for _, loc := range re.FindAllStringIndex(answer, -1) {
+		if !hasNegationPrefix(answer, loc) {
+			return loc
+		}
+	}
+	return nil
+}
+
+// replaceUnnegated 仅替换未被否定词修饰的命中，保留"不建议服用…"等安全提醒原文。
+func replaceUnnegated(re *regexp.Regexp, s, replacement string) string {
+	locs := re.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range locs {
+		b.WriteString(s[last:loc[0]])
+		if hasNegationPrefix(s, loc) {
+			b.WriteString(s[loc[0]:loc[1]])
+		} else {
+			b.WriteString(replacement)
+		}
+		last = loc[1]
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// hasNegationPrefix 判断处方命中是否处于否定语境：
+//   - 紧邻匹配前一字为 不/勿；或 忌/禁 且不是"禁忌"名词；
+//   - 命中文本前 6 个字符出现 不要/不宜/不应/不需/无需/不能/不可/禁止。
+//
+// 不能把任意"忌/禁"都当否定："无禁忌可服用华法林"是肯定推荐，必须拦截。
+// RE2 不支持 lookbehind，故在匹配循环内判定。
+func hasNegationPrefix(answer string, loc []int) bool {
+	prefix := []rune(answer[:loc[0]])
+	if len(prefix) > 0 && isPrefixNegation(prefix) {
+		return true
+	}
+	match := []rune(answer[loc[0]:loc[1]])
+	n := 6
+	if len(match) < n {
+		n = len(match)
+	}
+	head := string(match[:n])
+	for _, neg := range []string{"不要", "不宜", "不应", "不需", "无需", "不能", "不可", "禁止"} {
+		if strings.Contains(head, neg) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrefixNegation 只把紧邻的 不/勿 及非"禁忌"用法的 忌/禁 视为否定。
+func isPrefixNegation(prefix []rune) bool {
+	n := len(prefix)
+	switch prefix[n-1] {
+	case '不', '勿':
+		return true
+	case '忌':
+		return !(n >= 2 && prefix[n-2] == '禁')
+	case '禁':
+		return !(n >= 2 && prefix[n-2] == '忌')
+	default:
+		return false
+	}
 }
 
 // hasDiagnosisExceptionNear 判断诊断例外模式是否出现在匹配所在**句子**内。

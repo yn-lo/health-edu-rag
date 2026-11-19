@@ -187,6 +187,34 @@ func chunkContentsForLLM(chunks []rag.Chunk) []string {
 	return out
 }
 
+// citedChunks 返回答案实际引用到的候选文章（按 [资料N] 编号）。
+// references 落库/下发应只包含答案真正引用的证据，而不是全部检索候选：
+// 否则前端"参考来源"与正文不符、审计无法判断答案依据。
+// 答案完全未标注引用时退回全部候选（保留可追溯性，同时由调用方记录告警）。
+func citedChunks(answer string, chunks []rag.Chunk) []rag.Chunk {
+	if len(chunks) == 0 {
+		return chunks
+	}
+	used := make(map[int]struct{})
+	for _, m := range citeMarkerRe.FindAllStringSubmatch(answer, -1) {
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n < 1 || n > len(chunks) {
+			continue
+		}
+		used[n-1] = struct{}{}
+	}
+	if len(used) == 0 {
+		return chunks
+	}
+	out := make([]rag.Chunk, 0, len(used))
+	for i, c := range chunks {
+		if _, ok := used[i]; ok {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // toEntityRefs 将 rag.Chunk 转换为 entity.Reference（持久化到 messages.referenced_chunks）。
 func toEntityRefs(chunks []rag.Chunk) []entity.Reference {
 	out := make([]entity.Reference, 0, len(chunks))

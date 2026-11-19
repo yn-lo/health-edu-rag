@@ -49,6 +49,7 @@ const articleColumns = `id, title, content, summary, cover_image_url, status, ve
 	source, applicable_population, valid_until, content_risk,
 	published_content, published_content_hash, published_version,
 	published_title, published_summary, published_content_risk,
+	published_cover_image_url, published_valid_until,
 	created_at, updated_at`
 
 // articleScanCols 与 articleColumns 一一对应（两处必须同步修改）。
@@ -58,6 +59,7 @@ const articleScanCols = `i.id, i.title, i.content, i.summary, i.cover_image_url,
 	i.source, i.applicable_population, i.valid_until, i.content_risk,
 	i.published_content, i.published_content_hash, i.published_version,
 	i.published_title, i.published_summary, i.published_content_risk,
+	i.published_cover_image_url, i.published_valid_until,
 	i.created_at, i.updated_at`
 
 // ArticleRepo 文章仓储。
@@ -97,6 +99,7 @@ func (r *ArticleRepo) Create(ctx context.Context, a *entity.Article) error {
 		&a.Source, &a.ApplicablePopulation, &a.ValidUntil, &a.ContentRisk,
 		&a.PublishedContent, &a.PublishedContentHash, &a.PublishedVersion,
 		&a.PublishedTitle, &a.PublishedSummary, &a.PublishedContentRisk,
+		&a.PublishedCoverImageURL, &a.PublishedValidUntil,
 		&a.CreatedAt, &a.UpdatedAt,
 		&a.DepartmentName, &a.AuthorName,
 	)
@@ -171,6 +174,8 @@ func (r *ArticleRepo) GetPublishedByID(ctx context.Context, id int64) (*entity.A
 	a.Title = a.PublishedTitle
 	a.Summary = a.PublishedSummary
 	a.ContentRisk = a.PublishedContentRisk
+	a.CoverImageURL = a.PublishedCoverImageURL
+	a.ValidUntil = a.PublishedValidUntil
 	return a, nil
 }
 
@@ -224,6 +229,7 @@ func (r *ArticleRepo) ListPublished(
 		a.source, a.applicable_population, a.valid_until, a.content_risk,
 		a.published_content, a.published_content_hash, a.published_version,
 		a.published_title, a.published_summary, a.published_content_risk,
+		a.published_cover_image_url, a.published_valid_until,
 		a.created_at, a.updated_at,
 		COALESCE(d.name, ''), COALESCE(u.username, '')
 	FROM articles a
@@ -263,6 +269,7 @@ func (r *ArticleRepo) ListFeatured(ctx context.Context, departmentID *int64, lim
 		a.source, a.applicable_population, a.valid_until, a.content_risk,
 		a.published_content, a.published_content_hash, a.published_version,
 		a.published_title, a.published_summary, a.published_content_risk,
+		a.published_cover_image_url, a.published_valid_until,
 		a.created_at, a.updated_at,
 		COALESCE(d.name, ''), COALESCE(u.username, '')
 	FROM articles a
@@ -292,6 +299,7 @@ func (r *ArticleRepo) ListFeatured(ctx context.Context, departmentID *int64, lim
 type ListStaffFilter struct {
 	Status       string
 	DepartmentID *int64
+	Search       string // 按标题/摘要模糊匹配（前后端共用搜索框）
 }
 
 // ListForStaff 列出 staff 可见的文章（含 department_name JOIN），分页。
@@ -313,6 +321,10 @@ func (r *ArticleRepo) ListForStaff(
 		args = append(args, *f.DepartmentID)
 		where += fmt.Sprintf(" AND a.department_id = $%d", len(args))
 	}
+	if s := strings.TrimSpace(f.Search); s != "" {
+		args = append(args, "%"+s+"%")
+		where += fmt.Sprintf(" AND (a.title ILIKE $%d OR a.summary ILIKE $%d)", len(args), len(args))
+	}
 
 	var total int64
 	countSQL := `SELECT count(*) FROM articles a WHERE ` + where
@@ -327,6 +339,7 @@ func (r *ArticleRepo) ListForStaff(
 		a.source, a.applicable_population, a.valid_until, a.content_risk,
 		a.published_content, a.published_content_hash, a.published_version,
 		a.published_title, a.published_summary, a.published_content_risk,
+		a.published_cover_image_url, a.published_valid_until,
 		a.created_at, a.updated_at,
 		COALESCE(d.name, ''), COALESCE(u.username, '')
 	FROM articles a
@@ -380,6 +393,7 @@ func (r *ArticleRepo) UpdateFields(ctx context.Context, id int64, fields UpdateF
 		u.source, u.applicable_population, u.valid_until, u.content_risk,
 		u.published_content, u.published_content_hash, u.published_version,
 		u.published_title, u.published_summary, u.published_content_risk,
+		u.published_cover_image_url, u.published_valid_until,
 		u.created_at, u.updated_at,
 		COALESCE(d.name, ''), COALESCE(u2.username, '')
 	FROM updated u
@@ -501,6 +515,7 @@ var publishSnapshotSets = []string{
 	"published_version = version",
 	"published_title = title", "published_summary = summary",
 	"published_content_risk = content_risk",
+	"published_cover_image_url = cover_image_url", "published_valid_until = valid_until",
 }
 
 // UpdateStatus 状态机迁移：更新 status，可选设置 reviewer_id/review_comment/published_at。
@@ -568,23 +583,31 @@ type StatusUpdateOpts struct {
 	ExpectedVersion *int
 }
 
+// SetFeaturedRank 设置文章置顶位次（rank=0 取消置顶）。
+// 同一科室 rank 上有部分唯一索引 uq_articles_featured_rank，单条 UPDATE 同时"腾位+占位"时
+// 索引按行序逐行校验，命中顺序不定会触发 23505。因此拆成两步：先释放目标位次
+// （原占用者置 0、目标置 0），再给目标赋值。
+// 使用 postgres.Q 加入调用方事务（service 层 WithTx）：任一失败可整体回滚。
 func (r *ArticleRepo) SetFeaturedRank(ctx context.Context, id int64, rank int) error {
-	const sql = `UPDATE articles
-		SET featured_rank = CASE
-			WHEN id = $1 THEN $2
-			WHEN department_id = (SELECT department_id FROM articles WHERE id = $1)
-				AND featured_rank = $2 THEN 0
-			ELSE featured_rank
-		END,
-		updated_at = now()
-		WHERE id = $1 OR ($2 > 0 AND department_id = (SELECT department_id FROM articles WHERE id = $1)` +
-		` AND featured_rank = $2)`
-	tag, err := postgres.Q(ctx, r.pool).Exec(ctx, sql, id, rank)
+	q := postgres.Q(ctx, r.pool)
+	// 第一步：目标置 0，并释放同科室占用该位次的其他文章。
+	tag, err := q.Exec(ctx, `UPDATE articles
+		SET featured_rank = 0, updated_at = now()
+		WHERE id = $1
+		   OR ($2 > 0 AND department_id = (SELECT department_id FROM articles WHERE id = $1)
+		       AND featured_rank = $2)`, id, rank)
 	if err != nil {
-		return fmt.Errorf("set article featured rank: %w", err)
+		return fmt.Errorf("release featured rank: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	// 第二步：rank=0 时保持取消置顶；否则占用目标位次。
+	if rank > 0 {
+		if _, err := q.Exec(ctx, `UPDATE articles
+			SET featured_rank = $2, updated_at = now() WHERE id = $1`, id, rank); err != nil {
+			return fmt.Errorf("set featured rank: %w", err)
+		}
 	}
 	return nil
 }
@@ -687,6 +710,7 @@ func scanArticle(s postgres.Scanner) (*entity.Article, error) {
 		&a.Source, &a.ApplicablePopulation, &a.ValidUntil, &a.ContentRisk,
 		&a.PublishedContent, &a.PublishedContentHash, &a.PublishedVersion,
 		&a.PublishedTitle, &a.PublishedSummary, &a.PublishedContentRisk,
+		&a.PublishedCoverImageURL, &a.PublishedValidUntil,
 		&a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
@@ -704,6 +728,7 @@ func scanArticleWithNames(s postgres.Scanner) (*entity.Article, error) {
 		&a.Source, &a.ApplicablePopulation, &a.ValidUntil, &a.ContentRisk,
 		&a.PublishedContent, &a.PublishedContentHash, &a.PublishedVersion,
 		&a.PublishedTitle, &a.PublishedSummary, &a.PublishedContentRisk,
+		&a.PublishedCoverImageURL, &a.PublishedValidUntil,
 		&a.CreatedAt, &a.UpdatedAt,
 		&a.DepartmentName, &a.AuthorName,
 	)

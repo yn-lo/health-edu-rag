@@ -312,8 +312,11 @@ func (s *ChatSendService) handleCrisis(
 		hotline += "\n\n" + rag.AnonymousCrisisNote()
 	}
 	// DB store 内部含一次性重试并记录告警；匿名 store 为空操作。不阻断热线下发。
+	// DeptID 必须随危机轮写入：首轮危机（尚未选择科室）也要锁定到当前责任科室，
+	// 使危机事件通知能投递到 DEPT_ADMIN 而不是只有超管可见（P1）。
 	userID, aiID, err := sess.store.PersistCrisis(
-		ctx, in.Identity.UserID, TurnWrite{Content: in.Message, TurnID: st.turnID}, c, hotline,
+		ctx, in.Identity.UserID,
+		TurnWrite{Content: in.Message, TurnID: st.turnID, DeptID: sess.DeptID}, c, hotline,
 	)
 	if err != nil {
 		slog.ErrorContext(ctx, "chat crisis persist failed, still pushing hotline", "err", err)
@@ -321,7 +324,11 @@ func (s *ChatSendService) handleCrisis(
 	st.userMsgID, st.aiMsgID = userID, aiID
 	if aiID == uuid.Nil {
 		// 无服务端持久化结果（匿名危机不记录）：撤销本轮登记，避免后续重试被判"生成中"。
-		s.clearTurnRegistration(ctx, in)
+		// 用独立 ctx：客户端断开时请求 ctx 已取消，直接 Delete 会失败并锁死 request_id 15 分钟。
+		s.clearTurnRegistrationDetached(in)
+	} else {
+		// 危机轮已落库：后续 SSE 写失败时，重复提交应回放而不是再次插入危机事件/重复通知。
+		st.finalized = true
 	}
 
 	// 无论事务是否成功，都推送 crisis 热线（心理援助话术，已含热线号码）。

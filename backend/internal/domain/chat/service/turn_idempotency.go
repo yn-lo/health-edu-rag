@@ -54,9 +54,13 @@ func (s *ChatSendService) reserveTurn(ctx context.Context, in StreamInput) (func
 	// 本请求失败（未产生终态）时清除占位，避免异常中断后 request_id 被长期占用无法重试。
 	// 成功产生终态时 registerTurn 已覆盖为权威 turnRef，release 的幂等删除不影响。
 	return func() {
-		if raw, found, lerr := s.turns.Lookup(ctx, key); lerr == nil && found && raw == turnReservedMarker {
-			if derr := s.turns.Delete(ctx, key); derr != nil {
-				slog.WarnContext(ctx, "chat: idempotency release failed", "err", derr)
+		// 用独立 ctx：请求 ctx 可能已取消（客户端断开），用它删除占位会失败，
+		// 导致 request_id 被占满 TTL，客户端无法重试。
+		releaseCtx, cancel := context.WithTimeout(context.Background(), ragCleanupTimeout)
+		defer cancel()
+		if raw, found, lerr := s.turns.Lookup(releaseCtx, key); lerr == nil && found && raw == turnReservedMarker {
+			if derr := s.turns.Delete(releaseCtx, key); derr != nil {
+				slog.WarnContext(releaseCtx, "chat: idempotency release failed", "err", derr)
 			}
 		}
 	}, nil
@@ -159,6 +163,14 @@ func (s *ChatSendService) clearTurnRegistration(ctx context.Context, in StreamIn
 	if err := s.turns.Delete(ctx, idempotencyKey(in, in.RequestID)); err != nil {
 		slog.WarnContext(ctx, "chat: idempotency clear failed", "err", err)
 	}
+}
+
+// clearTurnRegistrationDetached 在请求 ctx 可能已取消的错误路径上撤销登记。
+// 使用独立超时 ctx，避免 Delete 因 context.Canceled 静默失败。
+func (s *ChatSendService) clearTurnRegistrationDetached(in StreamInput) {
+	ctx, cancel := context.WithTimeout(context.Background(), ragCleanupTimeout)
+	defer cancel()
+	s.clearTurnRegistration(ctx, in)
 }
 
 // sessionByID 按会话标识重建 Session（幂等重放用）：认证=加载自己的会话；匿名=设备命名空间下的会话。

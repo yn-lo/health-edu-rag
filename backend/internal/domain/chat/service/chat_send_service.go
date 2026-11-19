@@ -265,7 +265,14 @@ func (s *ChatSendService) Stream(ctx context.Context, in StreamInput, out SSEWri
 			constants.ResultRejected, constants.RejectReasonAssessmentUnavailable, st)
 	}
 
-	return s.proceedAfterAssessment(ctx, in, sess, out, assessment, history, st)
+	err = s.proceedAfterAssessment(ctx, in, sess, out, assessment, history, st)
+	if err != nil && !st.finalized {
+		// 已登记 turnRef 但本轮没有产生终态（落库失败/中断清理失败）：撤销登记，
+		// 允许客户端用同一 request_id 重试；否则会被回放逻辑判为"生成中"并锁 15 分钟（P2）。
+		// 终态已写入（st.finalized=true）时保留登记，重试应回放权威结果而不是重复生成。
+		s.clearTurnRegistrationDetached(in)
+	}
+	return err
 }
 
 // proceedAfterAssessment 在统一理解与审查之后执行动作分流：
@@ -542,6 +549,8 @@ func (s *ChatSendService) handleFixedReply(
 	if err := sess.store.FinalizeAssistant(ctx, aiMsgID, st.turnID, reply, resultCode, rejectReason, nil); err != nil {
 		return err
 	}
+	// 终态已落库：即使后续 SSE 写失败，重复提交也应回放权威结果而不是重新生成/重复落库。
+	st.finalized = true
 	if err := out.Write(EventAnswer, answerPayload{Mode: answerModeReplace, Text: reply}); err != nil {
 		return err
 	}
@@ -562,11 +571,13 @@ const ragCleanupTimeout = 5 * time.Second
 // 不含半角句点：安全规则模式不含这些字符，整句入审不会漏检；反之在句中切分可能切断规则匹配。
 const sentenceBoundaries = "。！？!?；;\n"
 
-// medicationIntentRe 对话中出现用药相关意图的信号（剂量/加量/停药等）。
+// medicationIntentRe 对话中出现用药相关意图的信号（剂量/增减药等）。
 // 用于判断本轮是否必须"完整生成 + 审核后展示"：这类答案一旦越界（给出个体化剂量方案），
 // 事后修正无法消除已展示内容的影响。
+// 不枚举药名/口语问句：那会把"可以吃水果吗""建议少吃油腻"等常规宣教也强制走完整审核；
+// 具体药名与"能不能吃某药"的语义判定由统一审查（Assessor）负责。
 var medicationIntentRe = regexp.MustCompile(
-	`(剂量|用量|加量|减量|停药|换药|加倍|翻倍|加服|少吃|多吃|mg|毫克|几片|吃几)`)
+	`(剂量|用量|加量|减量|停药|换药|加倍|翻倍|加服|mg|毫克|几片|吃几)`)
 
 // contentRiskHigh 高风险内容等级取值（对齐 wiki 域 articles.content_risk='high'）。
 const contentRiskHigh = "high"

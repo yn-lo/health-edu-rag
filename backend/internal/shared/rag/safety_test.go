@@ -354,6 +354,183 @@ func TestValidate_Prescription(t *testing.T) {
 	}
 }
 
+// 否定句中的"建议服用"是安全提醒，不能按处方推荐替换；混合句子只替换肯定命中。
+func TestValidate_PrescriptionNegation(t *testing.T) {
+	filter := NewDefaultOutputSafetyFilter(nil)
+	ctx := context.Background()
+
+	tests := []struct {
+		name       string
+		answer     string
+		wantBlock  bool
+		wantKeep   string // 替换后仍应保留的原文
+		wantRemove string // 替换后不应再出现的原文片段
+	}{
+		{
+			name:       "前半否定后半肯定",
+			answer:     "不建议服用布洛芬，建议服用对乙酰氨基酚",
+			wantBlock:  true,
+			wantKeep:   "不建议服用布洛芬",
+			wantRemove: "建议服用对乙酰氨基酚",
+		},
+		{
+			name:       "前半肯定后半否定",
+			answer:     "建议服用布洛芬，不建议服用阿司匹林",
+			wantBlock:  true,
+			wantKeep:   "不建议服用阿司匹林",
+			wantRemove: "建议服用布洛芬",
+		},
+		{
+			name:      "全部否定",
+			answer:    "不建议服用布洛芬",
+			wantBlock: false,
+			wantKeep:  "不建议服用布洛芬",
+		},
+		{
+			name:      "副词位于否定词前",
+			answer:    "也不建议服用布洛芬",
+			wantBlock: false,
+			wantKeep:  "也不建议服用布洛芬",
+		},
+		{
+			name:      "一般不建议服用",
+			answer:    "一般不建议服用布洛芬",
+			wantBlock: false,
+			wantKeep:  "一般不建议服用布洛芬",
+		},
+		{
+			name:       "建议长期服用",
+			answer:     "建议长期服用布洛芬",
+			wantBlock:  true,
+			wantRemove: "建议长期服用布洛芬",
+		},
+		{
+			name:       "建议按需服用",
+			answer:     "建议按需服用阿司匹林",
+			wantBlock:  true,
+			wantRemove: "建议按需服用阿司匹林",
+		},
+		{
+			name:       "否定后改用",
+			answer:     "不建议服用布洛芬，请改用对乙酰氨基酚",
+			wantBlock:  true,
+			wantKeep:   "不建议服用布洛芬",
+			wantRemove: "改用对乙酰氨基酚",
+		},
+		{
+			name:      "建议不要服用",
+			answer:    "建议不要服用布洛芬",
+			wantBlock: false,
+			wantKeep:  "建议不要服用布洛芬",
+		},
+		{
+			name:       "可以服用",
+			answer:     "可以服用布洛芬",
+			wantBlock:  true,
+			wantRemove: "可以服用布洛芬",
+		},
+		{
+			name:       "推荐服用",
+			answer:     "推荐服用阿司匹林",
+			wantBlock:  true,
+			wantRemove: "推荐服用阿司匹林",
+		},
+		{
+			name:      "可以吃水果不改写",
+			answer:    "可以吃水果",
+			wantBlock: false,
+			wantKeep:  "可以吃水果",
+		},
+		{
+			name:       "散剂",
+			answer:     "建议服用蒙脱石散",
+			wantBlock:  true,
+			wantRemove: "建议服用蒙脱石散",
+		},
+		{
+			name:       "颗粒剂",
+			answer:     "建议服用感冒灵颗粒",
+			wantBlock:  true,
+			wantRemove: "建议服用感冒灵颗粒",
+		},
+		{
+			name:       "药名后缀",
+			answer:     "建议服用氯雷他定",
+			wantBlock:  true,
+			wantRemove: "建议服用氯雷他定",
+		},
+		{
+			name:       "抗凝药",
+			answer:     "建议服用华法林",
+			wantBlock:  true,
+			wantRemove: "建议服用华法林",
+		},
+		{
+			name:       "降压药",
+			answer:     "建议服用氨氯地平",
+			wantBlock:  true,
+			wantRemove: "建议服用氨氯地平",
+		},
+		{
+			name:       "抗血小板药",
+			answer:     "建议服用氯吡格雷",
+			wantBlock:  true,
+			wantRemove: "建议服用氯吡格雷",
+		},
+		{
+			name:       "请您服用",
+			answer:     "请您服用氯吡格雷",
+			wantBlock:  true,
+			wantRemove: "请您服用氯吡格雷",
+		},
+		{
+			name:       "无禁忌时可服用",
+			answer:     "无禁忌时可服用华法林",
+			wantBlock:  true,
+			wantRemove: "可服用华法林",
+		},
+		{
+			name:       "如无禁忌可服用",
+			answer:     "如无禁忌可服用华法林",
+			wantBlock:  true,
+			wantRemove: "可服用华法林",
+		},
+		{
+			name:      "建议使用加湿器不改写",
+			answer:    "建议使用加湿器",
+			wantBlock: false,
+			wantKeep:  "建议使用加湿器",
+		},
+		{
+			name:      "建议多喝水不改写",
+			answer:    "建议多喝水",
+			wantBlock: false,
+			wantKeep:  "建议多喝水",
+		},
+		{
+			name:      "纯科普服用描述不改写",
+			answer:    "服用布洛芬时注意饭后",
+			wantBlock: false,
+			wantKeep:  "服用布洛芬时注意饭后",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := filter.Validate(ctx, tc.answer)
+			if tc.wantBlock != result.Blocked {
+				t.Errorf("期望 Blocked=%v，实际 %v (answer=%s)", tc.wantBlock, result.Blocked, tc.answer)
+			}
+			if tc.wantKeep != "" && !strings.Contains(result.Final, tc.wantKeep) {
+				t.Errorf("期望保留 %q，实际: %s", tc.wantKeep, result.Final)
+			}
+			if tc.wantRemove != "" && strings.Contains(result.Final, tc.wantRemove) {
+				t.Errorf("期望移除 %q，实际: %s", tc.wantRemove, result.Final)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // 输出侧：Validate — 停药越权（最高优先级）
 // ============================================================================

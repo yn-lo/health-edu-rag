@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS articles (
     CONSTRAINT articles_featured_rank_check CHECK (featured_rank >= 0)
 );
 
+-- 科室删除采用 SET NULL，但 service 层在事务内锁定科室并拒绝删除仍有未删除文章的科室；
+-- 仅允许删除"文章均已软删除"的科室，历史软删除行变为公共知识（is_deleted=true 不再可见）。
+ALTER TABLE articles DROP CONSTRAINT IF EXISTS articles_department_id_fkey;
+ALTER TABLE articles ADD CONSTRAINT articles_department_id_fkey
+    FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL;
+
 -- 置顶不限数量：featured_rank > 0 即置顶，数值表示科室内排序（1 最靠前）。
 -- 旧库可能残留 0–3 的历史 CHECK，重跑本文件时先删后建，统一为"仅非负"。
 ALTER TABLE articles DROP CONSTRAINT IF EXISTS articles_featured_rank_check;
@@ -146,14 +152,14 @@ UPDATE articles
    SET published_title = title, published_summary = summary, published_content_risk = content_risk
  WHERE status = 'published' AND published_content_risk = '';
 
--- 污染修复：修正此前按"published_at 非空"误回填的 pending 文章快照。
--- 这些文章的 published_content 是未审核的新稿，必须清空（宁可暂时不可读，也不公开未审核内容）。
--- 幂等：仅在快照与当前编辑稿一致（即确为误回填）时清空，已重新审核发布的文章不受影响。
+-- 快照补全：封面与有效期同样影响患者所见与检索可见性。
+-- 若读当前编辑稿，作者改封面可绕过审核立即生效；延长 valid_until 可让过期资料继续被检索命中（P1）。
+ALTER TABLE articles ADD COLUMN IF NOT EXISTS published_cover_image_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE articles ADD COLUMN IF NOT EXISTS published_valid_until TIMESTAMPTZ;
+-- 以 published_content_risk 已回填作为"已完成快照迁移"的标记，避免每次 schema 变更重复覆盖快照。
 UPDATE articles
-   SET published_content = '', published_content_hash = '', published_version = 0
- WHERE status = 'pending'
-   AND published_content <> ''
-   AND published_content = content;
+   SET published_cover_image_url = cover_image_url, published_valid_until = valid_until
+ WHERE status = 'published' AND published_content_risk <> '';
 
 CREATE TABLE IF NOT EXISTS article_chunks (
     id            BIGSERIAL   PRIMARY KEY,
@@ -561,6 +567,21 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications (recipient_role, is_read, created_at DESC) WHERE NOT is_read;
+
+-- 通知幂等：危机通知由"快速路径 + outbox relay 补投"两条路径投递，
+-- ExistsForRef 先查后插在并发下会重复落库。用表达式唯一索引把幂等下沉到数据库
+-- （recipient_dept_id 为 NULL 的广播通知也参与去重）。
+DELETE FROM notifications a
+ USING notifications b
+ WHERE a.id < b.id
+   AND a.recipient_role = b.recipient_role
+   AND a.type = b.type
+   AND a.ref_id = b.ref_id
+   AND COALESCE(a.recipient_dept_id, 0) = COALESCE(b.recipient_dept_id, 0)
+   AND a.ref_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_role_dept_type_ref
+    ON notifications (recipient_role, (COALESCE(recipient_dept_id, 0)), type, ref_id)
+    WHERE ref_id IS NOT NULL;
 
 -- ============================================================================
 -- 邀请码（PATIENT 注册强制邀请码）

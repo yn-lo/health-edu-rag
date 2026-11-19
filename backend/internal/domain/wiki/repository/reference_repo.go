@@ -133,6 +133,7 @@ type ListFilter struct {
 	Direction   string  // constants.ReferenceDirectionOutgoing/Incoming；空表示两者都查
 	CurrentDept int64   // 当前用户科室，用于方向过滤与 DEPT_ADMIN 隔离
 	DeptIDs     []int64 // 可见科室集合（SUPER_ADMIN 为 nil 表示全部）；非 nil 时限制 source/target 在集合内
+	Search      string  // 文章标题/科室名模糊搜索
 }
 
 // List 列出引用申请（含 JOIN 名称），分页。total 为符合条件的总数。
@@ -142,7 +143,11 @@ func (r *ReferenceRepo) List(
 	where, args := buildListWhere(f)
 
 	var total int64
-	countSQL := `SELECT count(*) FROM article_references ref WHERE ` + where
+	countSQL := `SELECT count(*) FROM article_references ref
+		LEFT JOIN articles a ON a.id = ref.article_id
+		LEFT JOIN departments sd ON sd.id = ref.source_dept_id
+		LEFT JOIN departments td ON td.id = ref.target_dept_id
+		WHERE ` + where
 	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count references: %w", err)
 	}

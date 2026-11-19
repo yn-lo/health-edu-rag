@@ -38,6 +38,7 @@ const routes = [
         path: 'articles/review',
         name: 'staff-article-review',
         component: () => import('@/staff/views/ArticleReview.vue'),
+        beforeEnter: adminRouteGuard,
         meta: hideTabBar,
       },
       {

@@ -97,11 +97,12 @@ func (r *PromptTemplateRepo) GetActive(
 // $1::varchar 显式标注类型：避免 PostgreSQL 在 `VALUES ($1)` 推断 varchar 与
 // `WHERE type = $1` 推断 text 之间产生 "inconsistent types deduced" 错误（SQLSTATE 42P08）。
 //
-// ponytail: 未包裹事务——若第二步 INSERT 失败，已失活的兄弟行无法回滚（admin 可重试），折中。
-// 升级路径：service 层用 TxManager.WithTx 包裹两条语句实现原子化。
+// ponytail: 两条语句由 service 层 TxManager.WithTx 包裹为原子操作，
+// 第二步 INSERT 失败会回滚兄弟行的失活（见 CreatePromptTemplate）。
 func (r *PromptTemplateRepo) Create(ctx context.Context, t *entity.PromptTemplate) error {
+	q := postgres.Q(ctx, r.pool)
 	if t.IsActive {
-		if _, err := r.pool.Exec(ctx,
+		if _, err := q.Exec(ctx,
 			`UPDATE prompt_templates SET is_active = FALSE, updated_at = now()
 			 WHERE type = $1 AND is_active = TRUE`,
 			t.Type,
@@ -109,12 +110,12 @@ func (r *PromptTemplateRepo) Create(ctx context.Context, t *entity.PromptTemplat
 			return fmt.Errorf("deactivate siblings: %w", err)
 		}
 	}
-	q := `INSERT INTO prompt_templates (type, version, content, is_active, description)
+	ins := `INSERT INTO prompt_templates (type, version, content, is_active, description)
 		VALUES ($1,
 			(SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_templates WHERE type = $1::varchar),
 			$2, $3, $4)
 		RETURNING ` + promptTemplateColumns
-	tmp, err := scanPromptTemplate(r.pool.QueryRow(ctx, q,
+	tmp, err := scanPromptTemplate(q.QueryRow(ctx, ins,
 		t.Type, t.Content, t.IsActive, t.Description,
 	))
 	if err != nil {
@@ -138,17 +139,18 @@ func (r *PromptTemplateRepo) Create(ctx context.Context, t *entity.PromptTemplat
 //	content 为 nil 时 pgx 发送无类型 NULL，$2::text cast 仍报 "could not determine data type"
 //	（SQLSTATE 42P08），故 content=nil 与非 nil 走两条 SQL。
 //
-// ponytail: 未包裹事务——若第二步 UPDATE 失败，兄弟已失活无法回滚（admin 可重试），折中。
-// 升级路径：service 层用 TxManager.WithTx 包裹两条语句实现原子化。
+// ponytail: 两条语句由 service 层 TxManager.WithTx 包裹为原子操作，
+// 第二步 UPDATE 失败会回滚兄弟行的失活（见 UpdatePromptTemplate）。
 func (r *PromptTemplateRepo) UpdateContentAndActive(
 	ctx context.Context, id int64, content *string, isActive *bool,
 ) (*entity.PromptTemplate, error) {
+	q := postgres.Q(ctx, r.pool)
 	activate := isActive != nil && *isActive
 
 	if activate {
 		// 第一步：失活同 type 的其他 active 行。
 		//   子查询读目标的 type：目标不存在时子查询返回 NULL，WHERE 不匹配，0 行受影响（安全）。
-		if _, err := r.pool.Exec(ctx,
+		if _, err := q.Exec(ctx,
 			`UPDATE prompt_templates SET is_active = FALSE, updated_at = now()
 			 WHERE type = (SELECT type FROM prompt_templates WHERE id = $1)
 			   AND is_active = TRUE
@@ -160,10 +162,10 @@ func (r *PromptTemplateRepo) UpdateContentAndActive(
 		// 第二步：激活目标行。content 非空时同步更新 content。
 		//   分两条 SQL：content 为 nil 时 pgx 发送无类型 NULL，即使 $2::text cast 也会报 42P08。
 		//   目标不存在时 0 行受影响，QueryRow 返回 ErrNoRows → ErrNotFound。
-		var q string
+		var sqlText string
 		var args []any
 		if content != nil {
-			q = `UPDATE prompt_templates SET
+			sqlText = `UPDATE prompt_templates SET
 					is_active = TRUE,
 					content = $2,
 					updated_at = now()
@@ -171,14 +173,14 @@ func (r *PromptTemplateRepo) UpdateContentAndActive(
 				RETURNING ` + promptTemplateColumns
 			args = []any{id, *content}
 		} else {
-			q = `UPDATE prompt_templates SET
+			sqlText = `UPDATE prompt_templates SET
 					is_active = TRUE,
 					updated_at = now()
 				WHERE id = $1
 				RETURNING ` + promptTemplateColumns
 			args = []any{id}
 		}
-		t, err := scanPromptTemplate(r.pool.QueryRow(ctx, q, args...))
+		t, err := scanPromptTemplate(q.QueryRow(ctx, sqlText, args...))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}

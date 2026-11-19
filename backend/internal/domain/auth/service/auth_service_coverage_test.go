@@ -395,8 +395,14 @@ func TestUpdateAccountRole(t *testing.T) {
 		_, err := svc.UpdateAccountRole(context.Background(), 1, constants.RoleSuperAdmin, 2, constants.RoleDoctor)
 		assertAppErr(t, err, 404, "AUTH_USER_NOT_FOUND")
 	})
+	t.Run("无科室转医护422", func(t *testing.T) {
+		repo := &mockUserRepo{user: &entity.User{ID: 2, Role: constants.RolePatient, IsActive: true}}
+		svc := newCoverageAuthService(t, repo, nil, nil)
+		_, err := svc.UpdateAccountRole(context.Background(), 1, constants.RoleSuperAdmin, 2, constants.RoleDoctor)
+		assertAppErr(t, err, 422, "AUTH_DEPT_REQUIRED")
+	})
 	t.Run("成功", func(t *testing.T) {
-		repo := &mockUserRepo{user: &entity.User{ID: 2, Role: constants.RoleNurse, IsActive: true}}
+		repo := &mockUserRepo{user: &entity.User{ID: 2, Role: constants.RoleNurse, IsActive: true, PrimaryDeptID: 10}}
 		svc := newCoverageAuthService(t, repo, nil, nil)
 		if _, err := svc.UpdateAccountRole(context.Background(), 1, constants.RoleSuperAdmin, 2, constants.RoleDoctor); err != nil {
 			t.Fatalf("期望 nil，实际 %v", err)

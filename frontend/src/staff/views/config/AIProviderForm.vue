@@ -58,12 +58,34 @@ function syncParamsToForm(params: Record<string, unknown>) {
  llmMaxTokens.value = typeof params.max_tokens === 'number' ? params.max_tokens : undefined
 }
 
-/** 从 LLM 表单字段组装回 params 对象（仅含用户修改过的字段） */
+/** 数字输入清空时 v-model.number 会得到 ''；转成 undefined 避免把空串发给上游模型。 */
+function numberOrUndefined(v: unknown): number | undefined {
+ return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+/** 从 LLM 表单字段组装回 params 对象：保留后端已有扩展键，只在用户实际改动时写入受控字段。 */
 function buildLlmParams(): Record<string, unknown> {
- const p: Record<string, unknown> = {}
- if (llmTemperature.value !== 0.7) p.temperature = llmTemperature.value
- if (llmTopP.value !== 1) p.top_p = llmTopP.value
- if (llmMaxTokens.value !== undefined) p.max_tokens = llmMaxTokens.value
+ const p: Record<string, unknown> = { ...form.value.params }
+ const orig: Record<string, unknown> = form.value.params ?? {}
+ const temperature = numberOrUndefined(llmTemperature.value)
+ const topP = numberOrUndefined(llmTopP.value)
+ const maxTokens = numberOrUndefined(llmMaxTokens.value)
+ const origTemperature = numberOrUndefined(orig.temperature)
+ const origTopP = numberOrUndefined(orig.top_p)
+ // 原配置没有该键且用户未改动（仍为 UI 默认值）时不新增，避免仅改名称就产生值漂移。
+ if (temperature === undefined ||
+   (origTemperature === undefined && temperature === 0.7)) {
+  delete p.temperature
+ } else {
+  p.temperature = temperature
+ }
+ if (topP === undefined || (origTopP === undefined && topP === 1)) {
+  delete p.top_p
+ } else {
+  p.top_p = topP
+ }
+ if (maxTokens !== undefined && maxTokens > 0) p.max_tokens = maxTokens
+ else delete p.max_tokens
  return p
 }
 
@@ -96,6 +118,8 @@ async function load() {
 
 async function submit() {
  errors.value = {}
+ // number 输入清空会得到 ''：提交前归一化，避免后端 *int 解码失败。
+ form.value.priority = numberOrUndefined(form.value.priority) ?? 0
  const e: Record<string, string> = {}
  if (!form.value.name.trim()) e.name = '请填写名称'
  if (!form.value.api_base.trim()) e.api_base = '请填写 API Base'

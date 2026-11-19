@@ -154,3 +154,18 @@ func (r *NotificationRepo) ExistsForRef(
 	}
 	return exists, nil
 }
+
+// HasActiveRoleInDept 判断指定科室是否存在启用中的某角色用户（通知可见性兜底用）。
+func (r *NotificationRepo) HasActiveRoleInDept(ctx context.Context, role string, deptID int64) (bool, error) {
+	const sql = `SELECT EXISTS (
+		SELECT 1 FROM users u
+		JOIN user_departments ud ON ud.user_id = u.id
+		WHERE ud.department_id = $1 AND ud.is_primary = true
+		  AND u.role = $2 AND u.is_active = true AND u.is_deleted = false
+	)`
+	var exists bool
+	if err := r.pool.QueryRow(ctx, sql, deptID, role).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check active role in dept: %w", err)
+	}
+	return exists, nil
+}

@@ -82,7 +82,7 @@ func (r *AIProviderRepo) Create(ctx context.Context, p *entity.AIProvider) error
 		 model_name, dimension, priority, parameters, is_active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, created_at, updated_at`
-	return r.pool.QueryRow(ctx, q,
+	return postgres.Q(ctx, r.pool).QueryRow(ctx, q,
 		p.Name, p.ProviderType, p.APIURL, p.IsFullURL, p.APIKeyEncrypted, p.APIKeyMasked,
 		p.ModelName, p.Dimension, p.Priority, p.Parameters, p.IsActive,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
@@ -95,7 +95,7 @@ func (r *AIProviderRepo) Update(ctx context.Context, p *entity.AIProvider) error
 		model_name = $8, dimension = $9, priority = $10, parameters = $11, is_active = $12, updated_at = now()
 		WHERE id = $1
 		RETURNING created_at, updated_at`
-	tag, err := r.pool.Exec(ctx, q,
+	tag, err := postgres.Q(ctx, r.pool).Exec(ctx, q,
 		p.ID, p.Name, p.ProviderType, p.APIURL, p.IsFullURL, p.APIKeyEncrypted, p.APIKeyMasked,
 		p.ModelName, p.Dimension, p.Priority, p.Parameters, p.IsActive,
 	)
@@ -136,7 +136,7 @@ func (r *AIProviderRepo) CurrentEmbeddingDimension(ctx context.Context) (int, er
 		WHERE attrelid = 'article_chunks'::regclass AND attname = 'embedding'),
 		0)`
 	var dim int
-	if err := r.pool.QueryRow(ctx, q).Scan(&dim); err != nil {
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, q).Scan(&dim); err != nil {
 		return 0, fmt.Errorf("query embedding dimension: %w", err)
 	}
 	return dim, nil
@@ -147,7 +147,7 @@ func (r *AIProviderRepo) CurrentEmbeddingDimension(ctx context.Context) (int, er
 func (r *AIProviderRepo) HasVectorizedChunks(ctx context.Context) (bool, error) {
 	const q = `SELECT EXISTS (SELECT 1 FROM article_chunks WHERE embedding IS NOT NULL)`
 	var has bool
-	if err := r.pool.QueryRow(ctx, q).Scan(&has); err != nil {
+	if err := postgres.Q(ctx, r.pool).QueryRow(ctx, q).Scan(&has); err != nil {
 		return false, fmt.Errorf("check vectorized chunks: %w", err)
 	}
 	return has, nil
@@ -179,18 +179,18 @@ func (r *AIProviderRepo) AlignEmbeddingDimension(ctx context.Context, dim int) e
 		return ErrEmbeddingDimChangeBlocked
 	}
 	// 1. ALTER COLUMN TYPE（pgvector 不接受 vector($1)，必须字面整数；dim 已校验 1-16000）
-	if _, err := r.pool.Exec(ctx,
+	if _, err := postgres.Q(ctx, r.pool).Exec(ctx,
 		fmt.Sprintf(`ALTER TABLE article_chunks ALTER COLUMN embedding TYPE vector(%d) USING NULL`, dim),
 	); err != nil {
 		return fmt.Errorf("alter embedding column to vector(%d): %w", dim, err)
 	}
 	// 2. 重建 hnsw 索引（先 DROP IF EXISTS，再 CREATE INDEX；不使用 IF NOT EXISTS 以避免索引残留）
-	if _, err := r.pool.Exec(ctx,
+	if _, err := postgres.Q(ctx, r.pool).Exec(ctx,
 		`DROP INDEX IF EXISTS idx_article_chunks_embedding`,
 	); err != nil {
 		return fmt.Errorf("drop hnsw index: %w", err)
 	}
-	if _, err := r.pool.Exec(ctx,
+	if _, err := postgres.Q(ctx, r.pool).Exec(ctx,
 		`CREATE INDEX idx_article_chunks_embedding
 			ON article_chunks USING hnsw (embedding vector_cosine_ops)
 			WITH (m = 16, ef_construction = 64)`,

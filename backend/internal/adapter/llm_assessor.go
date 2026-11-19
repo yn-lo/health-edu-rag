@@ -47,6 +47,8 @@ const assessSystemPrompt = `你是医院健康宣教平台的"理解与审查"�
 1. 先判断原始意图，再产生检索改写。不要把患者的话"规范化"成医学问题后再判断——
    否定（"我没有…"）、时间（"最近三天"）、人群（年龄/孕产妇）等限定会在改写中丢失。
 2. 同一句可能同时命中多个分类，必须分别给出，不要只保留一个主意图。
+2.1 询问"能不能/可不可以/该不该服用或停用某种药物"、具体药名、剂量或频次时，
+   即使未明确说"加量/减量"，也必须置 medication_change_request=true（它决定后端是否走受限/完整审核流程）。
 3. 风险状态允许 uncertain；not_detected 仅表示本次未识别到，不等于已证明安全。
    信息严重不足或语义模糊时用 uncertain，不要为了给出结论而猜。
 4. 缺信息才追问，且只追问影响本次回答的信息：问"什么是高血压"不需要病史；
@@ -123,8 +125,10 @@ func (a *LLMAssessor) AssessAndRewrite(
 			"model_recommended", out.RecommendedAction, "effective", out.Action())
 	}
 	if ev := out.RiskEvidence; len(ev) > 0 {
-		slog.InfoContext(ctx, "chat: assess risk evidence",
-			"self_harm_risk", out.SelfHarmRisk, "emergency_risk", out.EmergencyRisk, "evidence", ev)
+		// 不打印证据原文：其中是患者自伤/急症原话（PHI），日志只保留数量与风险类别。
+		slog.InfoContext(ctx, "chat: assess risk evidence recorded",
+			"evidence_count", len(ev),
+			"self_harm_risk", out.SelfHarmRisk, "emergency_risk", out.EmergencyRisk)
 	}
 	return out, nil
 }

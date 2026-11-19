@@ -65,12 +65,6 @@ func (s *ConfigService) CreateAIProvider(
 		return nil, apperrors.Validation("CONFIG_EMBEDDING_DIM_REQUIRED",
 			"embedding 类型的 provider 必须提供 dimension（向量维度）")
 	}
-	// 方案 C：embedding 维度变化时对齐 DB 列（DDL）。
-	if req.ProviderType == constants.ProviderTypeEmbedding {
-		if err := s.alignEmbeddingDimension(ctx, *req.Dimension); err != nil {
-			return nil, err
-		}
-	}
 	isActive := true
 	if req.IsActive != nil {
 		isActive = *req.IsActive
@@ -96,11 +90,20 @@ func (s *ConfigService) CreateAIProvider(
 		Parameters:      params,
 		IsActive:        isActive,
 	}
-	if err := s.aiProviderRepo.Create(ctx, p); err != nil {
+	// DDL 与 provider 行写入必须原子：任一失败都回滚，避免"列维度已改、provider 未落库"
+	// 或"provider 已落库、列维度仍是旧值"的中间态。
+	if err := s.withTx(ctx, func(ctx context.Context) error {
+		if req.ProviderType == constants.ProviderTypeEmbedding {
+			if err := s.alignEmbeddingDimension(ctx, *req.Dimension); err != nil {
+				return err
+			}
+		}
+		return s.aiProviderRepo.Create(ctx, p)
+	}); err != nil {
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperrors.Conflict("CONFIG_AI_PROVIDER_DUPLICATE", "AI 提供商名称已存在")
 		}
-		return nil, fmt.Errorf("create ai_provider: %w", err)
+		return nil, err
 	}
 	s.audit(ctx, entity.AuditActionCreate, entity.AuditEntityAIProvider, p.ID,
 		"provider_type", p.ProviderType, "dimension", p.Dimension)
@@ -140,7 +143,16 @@ func (s *ConfigService) UpdateAIProvider(
 	if err := validateProviderPriority(existing.Priority); err != nil {
 		return nil, err
 	}
-	if err := s.aiProviderRepo.Update(ctx, existing); err != nil {
+	// 行更新与维度 DDL 同一事务：对齐失败（已有向量/DDL 错误）时 provider 更新一并回滚。
+	if err := s.withTx(ctx, func(ctx context.Context) error {
+		if uerr := s.aiProviderRepo.Update(ctx, existing); uerr != nil {
+			return uerr
+		}
+		if dimChanged {
+			return s.alignEmbeddingDimension(ctx, *req.Dimension)
+		}
+		return nil
+	}); err != nil {
 		if postgres.IsUniqueViolation(err) {
 			return nil, apperrors.Conflict("CONFIG_AI_PROVIDER_DUPLICATE", "AI 提供商名称已存在")
 		}
@@ -169,9 +181,6 @@ func (s *ConfigService) resolveDimensionChange(
 	if *reqDim <= 0 {
 		return false, apperrors.Validation("CONFIG_EMBEDDING_DIM_REQUIRED",
 			"embedding 类型的 provider dimension 必须 > 0")
-	}
-	if err := s.alignEmbeddingDimension(ctx, *reqDim); err != nil {
-		return false, err
 	}
 	return true, nil
 }

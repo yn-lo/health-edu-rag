@@ -83,17 +83,24 @@ func (s *ConfigService) GetSafetyPolicy(ctx context.Context) (*SafetyPolicyRespo
 			wordSets[category] = SafetyPolicyWords{Source: "database", Words: words}
 		}
 	}
-	rules, _, err := s.ListSafetyRules(ctx, "", pagination.Params{Page: 1, PageSize: sensitiveWordsPageSize})
-	if err != nil {
-		return nil, err
-	}
+	// 安全规则同样分页读取全量：只取第一页会在规则超过单页上限时静默丢弃，
+	// 导致运行中的输出审查与展示策略不一致（P2）。
 	var outputRules []SafetyPolicyOutputRule
-	for _, rule := range rules {
-		if rule.IsActive {
-			outputRules = append(outputRules, SafetyPolicyOutputRule{
-				Category: rule.Category, Pattern: rule.Pattern, Action: rule.Action,
-				Replacement: rule.Replacement, Source: "database",
-			})
+	for page := 1; ; page++ {
+		rules, total, err := s.ListSafetyRules(ctx, "", pagination.Params{Page: page, PageSize: sensitiveWordsPageSize})
+		if err != nil {
+			return nil, err
+		}
+		for _, rule := range rules {
+			if rule.IsActive {
+				outputRules = append(outputRules, SafetyPolicyOutputRule{
+					Category: rule.Category, Pattern: rule.Pattern, Action: rule.Action,
+					Replacement: rule.Replacement, Source: "database",
+				})
+			}
+		}
+		if int64(page*sensitiveWordsPageSize) >= total || len(rules) == 0 {
+			break
 		}
 	}
 	if len(outputRules) == 0 {

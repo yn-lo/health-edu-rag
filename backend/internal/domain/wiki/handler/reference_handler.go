@@ -67,6 +67,7 @@ func (h *ReferenceHandler) List(w http.ResponseWriter, r *http.Request) {
 	items, total, err := h.svc.List(r.Context(), service.ListInput{
 		Status:    r.URL.Query().Get("status"),
 		Direction: r.URL.Query().Get("direction"),
+		Search:    r.URL.Query().Get("search"),
 		Actor:     actor,
 	}, p.PageSize, p.Offset())
 	if err != nil {

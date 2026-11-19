@@ -170,9 +170,11 @@ func (s *ChatSendService) handleEmptyStream(
 		constants.RejectReasonEmptyStream, nil,
 	); ferr != nil {
 		slog.ErrorContext(ctx, "finalize empty stream placeholder failed", "err", ferr)
+	} else {
+		// 仅落库成功才置位：失败时应允许客户端重试重新生成，而不是回放空结果。
+		st.finalized = true
 	}
 	cancelCleanup()
-	st.finalized = true
 	// 兜底话术即本轮答案（与落库一致），作为正文下发。
 	if err := out.Write(EventAnswer, answerPayload{Mode: answerModeReplace, Text: systemErr}); err != nil {
 		return err
@@ -471,14 +473,16 @@ func (s *ChatSendService) finalizeRAGOutput(
 	} else if st.partial {
 		resultCode = constants.ResultPartial
 	}
+	// 引用以答案实际引用为准：全部候选落库会让"参考来源"与正文不符、审计失真。
+	refs := toEntityRefs(citedChunks(final, st.chunks))
 	if err := sess.store.FinalizeAssistant(
-		ctx, st.aiMsgID, st.turnID, final, resultCode, "", toEntityRefs(st.chunks),
+		ctx, st.aiMsgID, st.turnID, final, resultCode, "", refs,
 	); err != nil {
 		return fmt.Errorf("finalize ai message: %w", err)
 	}
 	st.finalized = true // 阻止 defer 清理——已成功 finalize
 
-	if err := writeTurnResult(out, st, resultCode, "", toEntityRefs(st.chunks)); err != nil {
+	if err := writeTurnResult(out, st, resultCode, "", refs); err != nil {
 		return err
 	}
 	// spec §3.1：done 事件 data 为字面量 [DONE]，标记流结束
@@ -519,6 +523,8 @@ func (s *ChatSendService) cleanupRAGStream(ctx context.Context, sess *Session, s
 			constants.RejectReasonInterrupted, nil,
 		); ferr != nil {
 			slog.ErrorContext(ctx, "cleanup unreviewed deferred answer failed", "err", ferr)
+		} else {
+			st.finalized = true
 		}
 		return
 	}
@@ -532,9 +538,12 @@ func (s *ChatSendService) cleanupRAGStream(ctx context.Context, sess *Session, s
 			resultCode = constants.ResultPartial
 		}
 		if ferr := sess.store.FinalizeAssistant(
-			cleanupCtx, st.aiMsgID, st.turnID, out2.Final, resultCode, "", toEntityRefs(st.chunks),
+			cleanupCtx, st.aiMsgID, st.turnID, out2.Final, resultCode, "",
+			toEntityRefs(citedChunks(out2.Final, st.chunks)),
 		); ferr != nil {
 			slog.ErrorContext(ctx, "cleanup finalized stream failed", "err", ferr)
+		} else {
+			st.finalized = true
 		}
 		return
 	}
@@ -547,13 +556,18 @@ func (s *ChatSendService) cleanupRAGStream(ctx context.Context, sess *Session, s
 				constants.RejectReasonInterrupted, nil,
 			); ferr != nil {
 				slog.ErrorContext(ctx, "cleanup unsafe partial failed", "err", ferr)
+			} else {
+				st.finalized = true
 			}
 			return
 		}
 		if ferr := sess.store.FinalizeAssistant(
-			cleanupCtx, st.aiMsgID, st.turnID, out2.Final, constants.ResultPartial, "", toEntityRefs(st.chunks),
+			cleanupCtx, st.aiMsgID, st.turnID, out2.Final, constants.ResultPartial, "",
+			toEntityRefs(citedChunks(out2.Final, st.chunks)),
 		); ferr != nil {
 			slog.ErrorContext(ctx, "cleanup partial content failed", "err", ferr)
+		} else {
+			st.finalized = true
 		}
 		return
 	}
@@ -562,6 +576,8 @@ func (s *ChatSendService) cleanupRAGStream(ctx context.Context, sess *Session, s
 		constants.RejectReasonInterrupted, nil,
 	); ferr != nil {
 		slog.ErrorContext(ctx, "cleanup orphan placeholder failed", "err", ferr)
+	} else {
+		st.finalized = true
 	}
 }
 

@@ -183,6 +183,14 @@ func (s *ConfigService) invalidateCache(ctx context.Context, keys ...string) {
 	_ = s.cache.Del(ctx, keys...)
 }
 
+// withTx 在有 TxManager 时开启事务；nil（单元测试装配）时直接执行。
+func (s *ConfigService) withTx(ctx context.Context, fn func(context.Context) error) error {
+	if s.tx == nil {
+		return fn(ctx)
+	}
+	return s.tx.WithTx(ctx, fn)
+}
+
 // LLMReloadChannel 返回 LLM 热重载通知的 Redis 频道名。
 // 供 DI 层订阅使用。
 func LLMReloadChannel() string {

@@ -517,15 +517,23 @@ func TestCreateAccount_WeakPassword_Returns422(t *testing.T) {
 
 func TestCreateAccount_HappyPath_ReturnsDTO(t *testing.T) {
 	now := time.Now()
-	repo := &mockUserRepo{createUser: &entity.User{ID: 10, Username: "newdoc", Role: constants.RoleDoctor, IsActive: true, CreatedAt: now}}
+	created := &entity.User{ID: 10, Username: "newdoc", Role: constants.RoleDoctor, IsActive: true, CreatedAt: now}
+	repo := &mockUserRepo{createUser: created, user: created}
 	svc := newTestAuthService(repo, nil)
-	dto, err := svc.CreateAccount(context.Background(), constants.RoleSuperAdmin, 0, "newdoc", "Pass1234", constants.RoleDoctor, 0)
+	dto, err := svc.CreateAccount(context.Background(), constants.RoleSuperAdmin, 0, "newdoc", "Pass1234", constants.RoleDoctor, 10)
 	if err != nil {
 		t.Fatalf("期望 nil，实际 %v", err)
 	}
 	if dto.ID != 10 || dto.Username != "newdoc" || dto.Role != constants.RoleDoctor {
 		t.Errorf("DTO 字段不匹配: %+v", dto)
 	}
+}
+
+func TestCreateAccount_DoctorWithoutDept_Returns422(t *testing.T) {
+	repo := &mockUserRepo{}
+	svc := newTestAuthService(repo, nil)
+	_, err := svc.CreateAccount(context.Background(), constants.RoleSuperAdmin, 0, "newdoc", "Pass1234", constants.RoleDoctor, 0)
+	assertAppErr(t, err, 422, "AUTH_DEPT_REQUIRED")
 }
 
 // ============================================================================
@@ -674,7 +682,7 @@ func TestUpdateAccountRole_TargetNotFound_Returns404(t *testing.T) {
 
 func TestUpdateAccountRole_HappyPath_UpdatesRole(t *testing.T) {
 	now := time.Now()
-	repo := &mockUserRepo{user: &entity.User{ID: 2, Username: "doc", Role: constants.RoleDoctor, IsActive: true, CreatedAt: now}}
+	repo := &mockUserRepo{user: &entity.User{ID: 2, Username: "doc", Role: constants.RoleDoctor, IsActive: true, PrimaryDeptID: 10, CreatedAt: now}}
 	svc := newTestAuthService(repo, nil)
 	dto, err := svc.UpdateAccountRole(context.Background(), 1, constants.RoleSuperAdmin, 2, constants.RoleNurse)
 	if err != nil {
@@ -689,7 +697,7 @@ func TestUpdateAccountRole_HappyPath_UpdatesRole(t *testing.T) {
 }
 
 func TestUpdateAccountRole_RepoDown_PropagatesError(t *testing.T) {
-	repo := &mockUserRepo{user: &entity.User{ID: 2, Role: constants.RoleDoctor}, updateRoleErr: errors.New("db down")}
+	repo := &mockUserRepo{user: &entity.User{ID: 2, Role: constants.RoleDoctor, PrimaryDeptID: 10}, updateRoleErr: errors.New("db down")}
 	svc := newTestAuthService(repo, nil)
 	_, err := svc.UpdateAccountRole(context.Background(), 1, constants.RoleSuperAdmin, 2, constants.RoleNurse)
 	if err == nil {
