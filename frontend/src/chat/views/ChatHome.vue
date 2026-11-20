@@ -14,13 +14,14 @@ import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 import {
  Activity,
+ BookOpen,
  ChevronRight,
  Droplet,
  HeartPulse,
- Pill,
  Sparkles,
 } from '@lucide/vue'
 import { useDsToast } from '@/shared/composables/useDsToast'
+import { wikiApi } from '@/shared'
 import { useDepartments } from '@/chat/composables/useDepartments'
 import { useChatMode } from '@/chat/composables/useChatMode'
 import { DisclaimerFooter } from '@/shared/components'
@@ -75,12 +76,83 @@ interface QuickAction {
  icon: Component
 }
 
-const recommendedQuestions: QuickAction[] = [
-  { label: '高血压怎么吃更安全', value: '高血压怎么吃更安全', icon: HeartPulse },
-  { label: '糖尿病日常怎么管理', value: '糖尿病日常怎么管理', icon: Droplet },
-  { label: '术后康复注意什么', value: '术后康复注意什么', icon: Activity },
-  { label: '感冒发烧怎么用药', value: '感冒发烧怎么用药', icon: Pill },
+interface RecommendationTopic {
+ label: string
+ keywords: string[]
+ icon: Component
+}
+
+/** 安全可答的推荐主题：只覆盖宣教与就医指征，不含用药/诊断/急救。 */
+const RECOMMENDATION_TOPICS: RecommendationTopic[] = [
+ { label: '高血压患者饮食要注意什么', keywords: ['高血压'], icon: HeartPulse },
+ { label: '糖尿病日常怎么监测', keywords: ['糖尿病'], icon: Droplet },
+ { label: '术后康复要注意什么', keywords: ['术后', '手术'], icon: Activity },
+ { label: '出现哪些情况需要及时就医', keywords: ['就医', '就诊', '复查'], icon: HeartPulse },
 ]
+/** 推荐位最多展示 3 条，避免挤压首屏输入区。 */
+const MAX_RECOMMENDATIONS = 3
+/** 扫描当前科室已发布文章，用于判断推荐主题是否有知识库来源。 */
+const RECOMMENDATION_SCAN_SIZE = 50
+/** 命中这些词的标题不进入推荐位：避免把用户引导到受限的用药/诊断话题。 */
+const RESTRICTED_TITLE_RE = /用药|药物|剂量|停药|处方|诊断|确诊|急救|抢救/
+
+const recommendedQuestions = ref<QuickAction[]>([])
+const recommendationsLoading = ref(true)
+const recommendationsEmpty = ref(false)
+/** 未聚焦具体科室（id=0）时不要误称“当前科室”。 */
+const recommendationEmptyText = computed(() =>
+ selectedDepartmentId.value > 0 ? '当前科室知识库暂无可用推荐内容' : '知识库暂无可用推荐内容',
+)
+
+/** 请求序号：切换科室时丢弃旧科室的迟到响应。 */
+let recommendationSeq = 0
+
+/**
+ * 推荐问题必须“当前知识库可答”：
+ * 1. 按当前科室拉取已发布文章；
+ * 2. 命中安全主题才展示，最多 3 条；
+ * 3. 主题都没命中时，退化为基于真实文章标题的引导问题；
+ * 4. 知识库为空/接口失败时隐藏推荐，改为“切换科室”提示，避免展示必然被拒的问题。
+ */
+async function loadRecommendations() {
+ const seq = ++recommendationSeq
+ recommendationsLoading.value = true
+ try {
+  const res = await wikiApi.listArticles({
+   department_id: selectedDepartmentId.value > 0 ? selectedDepartmentId.value : undefined,
+   page_size: RECOMMENDATION_SCAN_SIZE,
+  })
+  if (seq !== recommendationSeq) return
+  const safeArticles = res.items.filter((a) => !RESTRICTED_TITLE_RE.test(a.title))
+  const picked: QuickAction[] = []
+  for (const topic of RECOMMENDATION_TOPICS) {
+   if (picked.length >= MAX_RECOMMENDATIONS) break
+   const matched = safeArticles.some((a) =>
+    topic.keywords.some((k) => a.title.includes(k) || a.summary.includes(k)),
+   )
+   if (matched) picked.push({ label: topic.label, value: topic.label, icon: topic.icon })
+  }
+  if (picked.length === 0) {
+   for (const article of safeArticles.slice(0, MAX_RECOMMENDATIONS)) {
+    picked.push({
+     label: article.title,
+     value: `请介绍「${article.title}」中患者需要注意什么`,
+     icon: BookOpen,
+    })
+   }
+  }
+  recommendedQuestions.value = picked
+  recommendationsEmpty.value = picked.length === 0
+ } catch {
+  if (seq !== recommendationSeq) return
+  recommendedQuestions.value = []
+  recommendationsEmpty.value = true
+ } finally {
+  if (seq === recommendationSeq) recommendationsLoading.value = false
+ }
+}
+
+watch(selectedDepartmentId, () => { void loadRecommendations() }, { immediate: true })
 
 function openHistory() {
  showHistory.value = true
@@ -150,9 +222,9 @@ function onPromptClick(item: QuickAction) {
  </p>
  </section>
 
- <!-- 向我提问 - 现代化推荐卡片 -->
+ <!-- 向我提问 - 仅展示当前知识库可答的安全主题 -->
  <section class="pb-[var(--spacer-20)]">
- <div class="flex flex-col gap-[var(--spacer-10)]">
+ <div v-if="recommendedQuestions.length > 0" class="flex flex-col gap-[var(--spacer-10)]">
  <button
  v-for="q in recommendedQuestions"
  :key="q.label"
@@ -165,6 +237,13 @@ function onPromptClick(item: QuickAction) {
  <span class="flex-1 min-w-0 text-body-base text-text font-medium leading-snug">{{ q.label }}</span>
  <ChevronRight :size="18" class="shrink-0 text-icon-tertiary transition-transform duration-200 group-hover:translate-x-0.5" />
  </button>
+ </div>
+ <div
+ v-else-if="!recommendationsLoading && recommendationsEmpty"
+ class="flex items-center gap-[var(--spacer-8)] rounded-[var(--radius-12)] bg-[var(--bg-base-secondary)] px-[var(--spacer-16)] py-[var(--spacer-12)] text-body-sm text-text-secondary"
+ >
+ <span class="flex-1">{{ recommendationEmptyText }}</span>
+ <button type="button" class="shrink-0 font-medium text-text-brand" @click="openDeptPicker">切换科室</button>
  </div>
  </section>
 
